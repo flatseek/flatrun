@@ -433,6 +433,28 @@ def _fetch_proj(
             base = cand
             break
     if base is None:
+        # Before raising the generic KeyError, check whether the
+        # model contains Mamba/SSM tensors. Bonsai-27B and similar
+        # hybrid checkpoints store ``blk.X.ssm_*`` alongside the
+        # sparse-attention layers; flatrun's text-only forwarder
+        # has no implementation for those. Detecting that here
+        # turns the cryptic KeyError into a clear pointer at what
+        # the user needs to do (load a non-hybrid model, or wait
+        # for Mamba support).
+        ssm_names = [
+            n for n in handles
+            if n.startswith("blk.") and "ssm" in n
+        ]
+        if ssm_names:
+            sample = ", ".join(sorted(ssm_names)[:3])
+            raise KeyError(
+                f"Model uses Mamba / SSM layers (e.g. {sample!r}); "
+                f"flatrun's forwarder is text-only attention and does "
+                f"not implement the SSM recurrence. Hybrid checkpoints "
+                f"like Bonsai-27B or Mamba-Transformer mixes are not "
+                f"supported. Use a non-hybrid model or LM Studio for "
+                f"these checkpoints."
+            )
         raise KeyError(
             f"Could not find tensor for projection {proj_name!r} at layer "
             f"{layer_index}. Tried: {[c + '.weight' for c in candidates]}"
@@ -568,6 +590,11 @@ def make_qwen2_forwarder(
     # ``cos_to_prev`` (cosine similarity between this layer's output and
     # the previous layer's). Used by ``_print_debug_stats``.
     _prev_hidden: np.ndarray | None = None
+    # Per-layer statistics populated by ``_record_layer_stats`` whenever
+    # ``--debug`` or ``--compare-layer`` is on. Dumped to JSON by
+    # ``_dump_layer_stats`` after the forwarder step finishes. The
+    # CLI uses this to cross-check against a reference runtime.
+    _layer_stats: list[dict] = []
 
     def _print_debug_stats(
         layer_idx: int,
@@ -630,6 +657,61 @@ def make_qwen2_forwarder(
             f"nan/inf={nan_inf_count} rss={_rss_mib():.0f}MiB\n"
         )
         _dbg.stderr.flush()
+        # Always collect stats (when either --debug or --compare-layer
+        # is on); the CLI decides whether to print, dump, or compare.
+        _record_layer_stats(idx, hidden, _prev_hidden, config.model_arch)
+
+    def _record_layer_stats(
+        layer_idx: int,
+        h: np.ndarray,
+        prev_h: "np.ndarray | None",
+        arch: str,
+    ) -> None:
+        """Append a per-layer stat dict to ``_layer_stats``.
+
+        Computed unconditionally - this is cheap (one mean / std / norm
+        pass over the hidden state) so we always do it. Whether the
+        CLI actually prints / dumps / compares depends on which flags
+        are set. The CLI reads ``_layer_stats`` after the step ends
+        via :func:`dump_layer_stats`.
+        """
+        finite = bool(np.isfinite(h).all())
+        nan_inf = int((~np.isfinite(h)).sum())
+        mean = float(h.mean()) if finite else float("nan")
+        std = float(h.std()) if finite else float("nan")
+        l2 = float(np.linalg.norm(h, axis=-1).mean())
+        max_abs = float(np.abs(h).max()) if finite else float("inf")
+        min_abs = float(np.abs(h).min()) if finite else float("nan")
+        if h.shape[0] > 1:
+            r0, rN = h[0], h[-1]
+            n0, nN = float(np.linalg.norm(r0)), float(np.linalg.norm(rN))
+            row_cos = float(r0 @ rN) / (n0 * nN + 1e-9)
+            adj_max = float(np.abs(h[:-1] - h[1:]).max())
+        else:
+            row_cos = 1.0
+            adj_max = 0.0
+        if prev_h is not None and prev_h.shape == h.shape:
+            cos_to_prev = float(h.flatten() @ prev_h.flatten()) / (
+                float(np.linalg.norm(h)) * float(np.linalg.norm(prev_h)) + 1e-9
+            )
+        else:
+            cos_to_prev = 1.0
+        _layer_stats.append(
+            {
+                "layer": int(layer_idx),
+                "arch": arch,
+                "shape": list(h.shape),
+                "mean": mean,
+                "std": std,
+                "l2": l2,
+                "max_abs": max_abs,
+                "min_abs": min_abs,
+                "row_cos": row_cos,
+                "adj_max": adj_max,
+                "cos_to_prev": cos_to_prev,
+                "nan_inf": nan_inf,
+            }
+        )
 
     def _rss_mib() -> float:
         """Return current process RSS in MiB.
