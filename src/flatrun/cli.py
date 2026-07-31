@@ -1078,21 +1078,18 @@ def cmd_chat(args) -> int:
         bundle["executor"].kv_cache.reset()
         turn += 1
         t0 = time.perf_counter()
-        # Print "Assistant: " in green, then a newline. The newline
-        # is critical: without it stdout's cursor stays on the
-        # "Assistant: " line, and the LiveCursor's stderr output
-        # (which uses ``\r``) would end up on the same physical
-        # line as the streamed content - that's the bug that
-        # produced ``⠏ssistant:``. Moving stdout to a fresh line
-        # first means the cursor on stderr's own line stays
-        # visually separated from the streamed transcript below.
+        # Print "Assistant: " in green, then stream the model's
+        # tokens onto the next line. The cursor icon lives on the
+        # thinking line below the streamed answer (printed by
+        # ``_print_thinking``) rather than next to the streamed
+        # content - the LiveCursor rewrite-the-cursor-cell-via-\r
+        # approach was eating the streamed transcript.
         sys.stdout.write(f"{_C_ASSISTANT}Assistant:{_C_ASSISTANT_END}\n")
         sys.stdout.flush()
-        with LiveCursor():
-            generated, _, _ = _generate_continuation(
-                bundle, args, prompt_ids, args.max_new,
-                stream=lambda t: print(t, end="", flush=True),
-            )
+        generated, _, _ = _generate_continuation(
+            bundle, args, prompt_ids, args.max_new,
+            stream=lambda t: print(t, end="", flush=True),
+        )
         print()  # newline after the streamed reply
         dt = time.perf_counter() - t0
         raw_text = tokenizer.decode(generated)
@@ -1102,11 +1099,18 @@ def cmd_chat(args) -> int:
                 reply_text = reply_text.split(stop, 1)[0]
                 break
         if thinking:
-            # ``Thinking:`` in dim, body in grey italic. ``_split_thinking``
-            # stripped the markers and ``_flatten_thinking`` collapsed
-            # newlines. The live yellow cursor that pulsed during
-            # generation is on stderr, two lines up.
-            print(f"\n{_C_DIM}Thinking:{_C_END} {_C_GREY}{_C_ITALIC}{thinking}{_C_END}")
+            # Layout: yellow cursor icon, then dim "Thinking:",
+            # then grey italic body. The cursor is the FIRST cell of
+            # the thinking line (not the streamed line), so the
+            # user sees a clear separation: streamed content on one
+            # line, thinking on the next. ``_split_thinking``
+            # stripped the ``<think>``/``</think>`` markers and
+            # ``_flatten_thinking`` collapsed newlines.
+            print(
+                f"\n{_C_YELLOW}⠋{_C_END}"
+                f"{_C_DIM}Thinking:{_C_END} "
+                f"{_C_GREY}{_C_ITALIC}{thinking}{_C_END}"
+            )
         # ``Assistant:`` in green; the streamed reply is already on
         # the line above so we just print it here for the REPL log.
         print(f"{_C_ASSISTANT}Assistant: {reply_text}{_C_ASSISTANT_END}")
