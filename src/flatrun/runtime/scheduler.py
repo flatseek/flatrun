@@ -71,16 +71,24 @@ class LayerHandles:
     The class also carries optional context the scheduler sets before
     calling the user's compute function:
 
-    * ``layer_index`` - the layer's position in the model (0-indexed).
+    * ``layer_index`` - the layer's position in the model (0-indexed,
+      from the manifest). Stable across custom selections.
     * ``tokens`` - the token sequence for the current decoder step.
       This is what the Qwen2 forwarder reads to look up embeddings.
+    * ``is_first`` / ``is_last`` - True for the first/last layer in
+      *execution order* (the scheduler's selected subset). The Qwen2
+      forwarder uses these to decide when to embed tokens and when
+      to apply the final norm + LM head.
+    * ``position`` - the 0-indexed position within the selected layer
+      subset. Useful for tools that want to track "which selected
+      layer is this" without re-deriving it from ``layer_index``.
 
-    These are plain attributes, not slots, because they're set after
-    construction by the scheduler. They are also exposed via read-only
-    ``layer_index()`` / ``tokens()`` helpers for convenience.
+    These are set after construction by the scheduler (the
+    constructor accepts ``None`` for them and the scheduler
+    overwrites them before invoking the compute callback).
     """
 
-    __slots__ = ("_handles", "_order", "_closed", "layer_index", "tokens")
+    __slots__ = ("_handles", "_order", "_closed", "layer_index", "tokens", "is_first", "is_last", "position")
 
     def __init__(self, handles: dict[str, TensorHandle], order: Sequence[str]) -> None:
         self._handles = dict(handles)
@@ -88,6 +96,14 @@ class LayerHandles:
         self._closed = False
         self.layer_index: int | None = None
         self.tokens: Sequence[int] | None = None
+        # Position within the scheduler's execution order, not the
+        # model's original index. ``is_first`` / ``is_last`` are the
+        # scheduler's view of "first/last in the layers we are
+        # actually running" — they flip regardless of the original
+        # index when the user passes a custom layer selection.
+        self.is_first: bool = False
+        self.is_last: bool = False
+        self.position: int = 0
 
     def __getitem__(self, name: str) -> TensorHandle:
         return self._handles[name]
@@ -185,6 +201,20 @@ class LayerScheduler(Generic[R]):
     def stats(self) -> SchedulerStats:
         return self._stats
 
+    @property
+    def manager(self) -> MemoryManager:
+        """Expose the underlying :class:`MemoryManager`.
+
+        Useful for diagnostics code (e.g. the prediction-evolution
+        analyzer) that needs to load post-layer tensors like
+        ``model.norm.weight`` and ``lm_head.weight`` at every
+        layer, not just the last one. The forwarder closure
+        captures the manager so the per-layer recording can
+        request those tensors without going through the handles
+        dict.
+        """
+        return self._manager
+
     # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
@@ -197,10 +227,10 @@ class LayerScheduler(Generic[R]):
         selecting the next-token logits, etc.).
         """
         results: list[R] = []
-        for idx, layer in enumerate(self._layers):
+        for position, layer in enumerate(self._layers):
             try:
                 self._maybe_prefetch(layer)
-                handles = self._acquire_layer(layer)
+                handles = self._acquire_layer(layer, position)
                 handles.tokens = self._current_tokens
                 result = compute(layer, handles)
                 results.append(result)  # type: ignore[arg-type]
@@ -221,7 +251,7 @@ class LayerScheduler(Generic[R]):
             raise LayerStreamingError(f"Layer index {index} out of range")
         layer = self._layers[index]
         self._maybe_prefetch(layer)
-        handles = self._acquire_layer(layer)
+        handles = self._acquire_layer(layer, index)
         try:
             return compute(layer, handles)
         finally:
@@ -246,15 +276,22 @@ class LayerScheduler(Generic[R]):
                 # Prefetch failures never abort the run.
                 pass
 
-    def _acquire_layer(self, layer: LayerDescriptor) -> LayerHandles:
+    def _acquire_layer(self, layer: LayerDescriptor, position: int) -> LayerHandles:
         handles: dict[str, TensorHandle] = {}
-        # First layer picks up pre-layer tensors (embedding, etc.).
-        if layer.index == 0:
+        # First layer in *execution order* picks up pre-layer tensors
+        # (embedding, etc.). Detected by position rather than the
+        # original ``layer.index`` so a custom layer selection like
+        # ``[1, 3, 4, 6, 7, 8]`` still embeds tokens on its first
+        # selected layer.
+        is_first = position == 0
+        is_last = position == len(self._layers) - 1
+        if is_first:
             for name in self._pre_layer_names:
                 handles[name] = self._manager.acquire(name)
                 self._stats.tensors_loaded += 1
-        # Last "logical" layer picks up post-layer tensors (norm, lm_head).
-        is_last = layer.index == len(self._layers) - 1
+        # Last layer in execution order picks up post-layer tensors
+        # (final norm, LM head). Same reasoning — position, not
+        # original index.
         if is_last:
             for name in self._post_layer_names:
                 handles[name] = self._manager.acquire(name)
@@ -276,13 +313,10 @@ class LayerScheduler(Generic[R]):
             order += list(self._post_layer_names)
         lh = LayerHandles(handles, order)
         lh.layer_index = layer.index
+        lh.is_first = is_first
+        lh.is_last = is_last
+        lh.position = position
         return lh
-
-    def _release_layer(self, handles: LayerHandles) -> None:
-        for name in handles.names_in_order():
-            if self._manager.release(name):
-                self._stats.tensors_released += 1
-        handles.close()
 
     def _release_layer(self, handles: LayerHandles) -> None:
         for name in handles.names_in_order():

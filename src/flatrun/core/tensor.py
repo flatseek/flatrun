@@ -260,6 +260,36 @@ class MmapTensorHandle(TensorHandle):
         return bytes(self._mmap[self._offset : self._offset + self.byte_size])
 
     def _close_native(self) -> None:
+        # Hint the kernel to drop the mmap pages for this region.
+        #
+        # Without this hint the pages stay in the page cache (and count
+        # toward RSS) for the entire process lifetime once they have been
+        # touched. The backend keeps the parent mmap alive for the
+        # duration of inference, so even ``close()`` on the handle does
+        # not unmap the region. For very large models (>= 14B in Q4_K,
+        # 27B+, ...) the cumulative page cache can grow past several GB
+        # before the model is fully streamed, which is enough to OOM
+        # memory-constrained hosts even though the scheduler logically
+        # "released" the layer.
+        #
+        # Trade-off: ``MADV_DONTNEED`` is page-aligned. If two small
+        # tensors share a 4 KiB page, the kernel may discard the page
+        # for both tensors even though only one was released. The next
+        # access of the still-resident tensor re-faults from disk -
+        # cheap for layer-sized tensors, measurable for tiny ones.
+        # We only call madvise for tensors >= 1 MiB so the alignment
+        # cost is bounded.
+        if self._mmap is not None and self.byte_size >= 1024 * 1024:
+            try:
+                madv_dontneed = getattr(mmap, "MADV_DONTNEED", None)
+                if madv_dontneed is not None:
+                    self._mmap.madvise(madv_dontneed, self._offset, self.byte_size)
+            except Exception:
+                # madvise is best-effort. If the kernel rejects the
+                # hint (some FUSE mounts, exotic filesystems), fall
+                # back to the old behaviour - the page stays resident
+                # until the backend closes.
+                pass
         # We don't own the mmap - the backend closes it. Just drop the ref.
         self._mmap = None  # type: ignore[assignment]
 

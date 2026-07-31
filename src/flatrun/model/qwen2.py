@@ -36,6 +36,7 @@ from ..dequant.loader import dequant_handle, dequant_mlx_weight
 from ..dequant.mlx import dequant_mlx_4bit_split
 from ..runtime.kv_cache import KVCache
 from ..runtime.scheduler import LayerHandles
+from ..utils.debug import per_token_metrics, print_per_token_table
 from ..utils.types import LayerDescriptor
 
 
@@ -527,16 +528,32 @@ def make_qwen2_forwarder(
     dtype: str = "float32",
     enable_dequant_cache: bool = False,
     memory_trace: bool = False,
+    last_index: int | None = None,
+    tokenizer: object | None = None,
+    max_per_token_rows: int = 16,
+    exclude_token_ids: set[int] | None = None,
+    analyzer: object | None = None,
+    manager: object | None = None,
 ) -> Callable[[LayerDescriptor, LayerHandles, KVCache], np.ndarray]:
     """Return a ``ForwardFn`` that runs a Qwen2 / Llama forward pass.
 
     The returned callable accepts ``(layer, handles, kv_cache)`` and
 
-    * on layer 0 embeds the token ids and then runs decoder block 0,
-    * on the last layer runs the decoder block **and then** the final
-      norm + LM head, returning ``(seq, vocab)`` logits,
+    * on the first layer in execution order (signalled by
+      ``handles.is_first``) embeds the token ids and then runs that
+      decoder block,
+    * on the last layer in execution order (``handles.is_last``)
+      runs the decoder block **and then** the final norm + LM head,
+      returning ``(seq, vocab)`` logits,
     * on every other layer runs the decoder block and returns hidden
       states.
+
+    Activation handling is independent of the model's original layer
+    numbering, so custom selections (``--max-layers=N`` or
+    ``--layers=1,3,4,6,7,8``) work the same way: the scheduler flags
+    the first and last selected layer via ``LayerHandles.is_first``
+    / ``is_last`` and the forwarder uses those flags rather than
+    hardcoded ``idx == 0`` / ``idx == last_index`` checks.
 
     Activations are computed in float32 regardless of the storage
     dtype. ``dtype`` only controls how weights are materialised.
@@ -554,6 +571,53 @@ def make_qwen2_forwarder(
     ``memory_trace`` (default ``False``) prints per-layer memory
     diagnostics to stderr - useful for verifying streaming mode
     on large models.
+
+    ``last_index`` (default ``None``) overrides the implicit
+    ``config.num_hidden_layers - 1`` used as the gate for the final
+    norm + LM head. The scheduler's ``is_last`` flag is the
+    authoritative source for "this is the last layer in our
+    selection", but a caller can pass ``last_index`` here to make
+    the final norm + LM head fire on a different layer if the
+    forwarder is being driven outside the scheduler (e.g. from a
+    custom executor).
+
+    ``tokenizer`` (default ``None``) is the running CLI's tokenizer
+    object. The forwarder uses it only in the per-token debug
+    table to print the decoded token alongside its id. When
+    ``None`` the column shows ``-`` so the table layout stays
+    stable. The forwarder never calls ``tokenizer.encode`` or
+    mutates the tokenizer state.
+
+    ``max_per_token_rows`` (default 16) bounds how many tokens the
+    per-token debug table prints per layer. Long sequences are
+    truncated to the top-N by the sort key; increase the value
+    when you need to inspect every position.
+
+    ``exclude_token_ids`` (default ``None``) is a set of token IDs
+    to omit from the per-token debug table. Pass the tokenizer's
+    ``added_tokens.keys()`` to suppress BOS / EOS / chat template
+    markers so the table focuses on content tokens. Metrics are
+    still computed on the full hidden state — only the *display*
+    filters rows. When ``None`` no filtering is applied.
+
+    ``analyzer`` (default ``None``) is an optional
+    :class:`flatrun.utils.debug.PredictionAnalyzer` instance. The
+    forwarder applies the final RMSNorm + LM head to every
+    layer's hidden state and records the resulting next-token
+    logits on the analyzer. Recording is gated by the analyzer's
+    internal dedup (``_seen``) so the autoregressive decode loop
+    after the prompt prefill is a no-op. The analyzer's
+    ``summarize`` produces the Prediction Evolution report;
+    ``save`` persists the JSON.
+
+    ``manager`` (default ``None``) is the
+    :class:`MemoryManager` the scheduler is bound to. It is
+    required when ``analyzer`` is set, because the final norm
+    and LM head live in the post-layer bookend that the
+    scheduler only attaches to the last selected layer. The
+    forwarder uses the manager to load these tensors on demand
+    so every layer can produce a prediction. When ``analyzer``
+    is ``None`` the manager is not consulted.
     """
     np_dtype = np.dtype(dtype)
     head_dim = config.head_dim or (config.hidden_size // config.num_attention_heads)
@@ -567,7 +631,83 @@ def make_qwen2_forwarder(
     head_group = n_heads // n_kv_heads  # GQA group size
     q_dim = n_heads * head_dim
     kv_dim = n_kv_heads * head_dim
-    last_index = config.num_hidden_layers - 1
+    final_layer_index = (
+        last_index if last_index is not None else config.num_hidden_layers - 1
+    )
+
+    # Cached norm and LM-head weights for the prediction-evolution
+    # analyzer. The scheduler attaches these tensors to the *last*
+    # layer's handles only; for every other layer we load them via
+    # the manager once and reuse across the rest of the forward
+    # pass. The cache is invalidated when the analyzer freezes
+    # (i.e. between steps in autoregressive decoding) because the
+    # handle objects can be closed by the manager.
+    _norm_w_cache: np.ndarray | None = None
+    _head_w_cache: np.ndarray | None = None
+
+    def _compute_layer_logits(
+        h: np.ndarray,
+        handles: LayerHandles,
+        state: dict,
+        mgr: object | None,
+    ) -> np.ndarray | None:
+        """Apply final norm + LM head to ``h`` and return logits.
+
+        Returns ``None`` when the manager is missing (the
+        analyzer needs a manager to load post-layer tensors at
+        non-last layers; the existing last-layer path uses
+        ``handles`` directly and is unaffected).
+
+        The norm and head weights are cached in the closure
+        so a single step with N layers only loads them once
+        even though there are N invocations. The cache is
+        intentionally bound to the closure (not the analyzer)
+        so it can be replaced cheaply; the analyzer doesn't
+        own the tensors.
+        """
+        nonlocal _norm_w_cache, _head_w_cache
+        if mgr is None:
+            return None
+
+        # Prefer the handles dict when the scheduler already
+        # attached norm/head (last layer). Otherwise load from
+        # the manager. The second path is the common one for
+        # the prediction-evolution analyzer.
+        if "model.norm.weight" in handles:
+            norm_w = handles["model.norm.weight"].as_numpy().astype(np.float32)
+        elif _norm_w_cache is not None:
+            norm_w = _norm_w_cache
+        else:
+            norm_handle = mgr.acquire("model.norm.weight")
+            norm_w = norm_handle.as_numpy().astype(np.float32)
+            _norm_w_cache = norm_w
+
+        # Tied embeddings shortcut: the head is the embedding
+        # table. ``state["embed"]`` is set on the first layer
+        # and persists for the rest of the forward pass, so
+        # both the cache check and the resolution are stable.
+        if config.tie_word_embeddings:
+            head_w = state.get("embed")
+            if head_w is None:
+                return None
+        elif _head_w_cache is not None:
+            head_w = _head_w_cache
+        else:
+            head_w = _fetch_proj(
+                handles, -1, "lm_head", config, np_dtype,
+                dequant_cache=dequant_cache,
+            )
+            head_w = _as_linear(head_w, config.hidden_size, "lm_head")
+            _head_w_cache = head_w
+
+        # Apply the same norm the last layer uses. Gemma 3's
+        # ``model.norm`` is ``(1 + weight)``-style; everything
+        # else uses plain RMSNorm.
+        if config.model_arch == "gemma3":
+            normed = _gemma3_norm(h, norm_w, config.rms_norm_eps)
+        else:
+            normed = _rms_norm(h, norm_w, config.rms_norm_eps)
+        return (normed @ head_w.astype(np.float32).T).astype(np.float32)
 
     # Dequant cache is opt-in. When disabled (the default) the
     # forwarder runs in pure streaming mode: every layer's weights
@@ -595,6 +735,38 @@ def make_qwen2_forwarder(
     # ``_dump_layer_stats`` after the forwarder step finishes. The
     # CLI uses this to cross-check against a reference runtime.
     _layer_stats: list[dict] = []
+
+    def _numpy_stats() -> tuple[float, int, list[tuple[str, int]]]:
+        """Snapshot of currently-reachable numpy arrays.
+
+        Walks ``gc.get_objects()`` which is O(n) — only call from the
+        debug path. Returns ``(total_mib, count, top3)`` where ``top3``
+        is a list of ``(shape|dtype, nbytes)`` for the three largest
+        arrays. Useful for identifying which decode-step allocation is
+        still alive when it should have been freed by the next layer.
+
+        A growing ``total_mib`` across consecutive layers means some
+        local reference is being kept alive (del block missing, a
+        closure capture, or a shapes-not-equal ``else`` branch that
+        pins the previous layer's buffer). A growing ``count`` is the
+        same signal at finer granularity.
+        """
+        import gc
+        total = 0
+        count = 0
+        top: list[tuple[str, int]] = []
+        for _obj in gc.get_objects():
+            if not isinstance(_obj, np.ndarray):
+                continue
+            count += 1
+            nbytes = int(_obj.nbytes)
+            total += nbytes
+            label = f"{'x'.join(str(s) for s in _obj.shape)}|{_obj.dtype}"
+            if len(top) < 3 or nbytes > top[-1][1]:
+                top.append((label, nbytes))
+                top.sort(key=lambda x: -x[1])
+                del top[3:]
+        return total / 1024.0 / 1024.0, count, top
 
     def _print_debug_stats(
         layer_idx: int,
@@ -625,6 +797,25 @@ def make_qwen2_forwarder(
             layer is essentially producing noise.
           - ``nan/inf`` - count of non-finite values; non-zero means
             the forward pass is no longer safe to use.
+          - ``rss`` - process RSS via ``psutil`` / ``/proc`` /
+            ``resource``. Includes the OS page cache for any mmap'd
+            tensors — bounded by the configured ``--cache-mb``.
+          - ``py`` - total bytes of all reachable ``np.ndarray`` objects
+            (``gc.get_objects()`` walk). Should stay flat between
+            layers; a monotonic rise means a previous layer's tensor
+            is being retained.
+          - ``ndarr`` - count of reachable ``np.ndarray`` instances.
+            Same signal as ``py`` at finer granularity.
+          - ``hidden`` - bytes of *this* layer's hidden state. Useful
+            for sanity-checking that ``py`` growth exceeds the per-layer
+            hidden size (which would be a true leak) versus just
+            tracking the same buffer.
+          - ``top`` - up to three largest ndarrays by size, as
+            ``shape|dtype=bytes``. When the model is healthy across
+            layers the top entry is almost always the dequantized
+            embedding (or the freshly-loaded q/k/v stack); a new
+            shape appearing in the top across layers is the smoking
+            gun for a missed ``del``.
         """
         import sys as _dbg
         finite = np.isfinite(h).all()
@@ -648,18 +839,31 @@ def make_qwen2_forwarder(
             )
         else:
             cos_to_prev = 1.0
+        py_mib, n_arr, top_arr = _numpy_stats()
+        hidden_mib = int(h.nbytes) / 1024.0 / 1024.0
+        top_parts = []
+        for _lbl, _sz in top_arr:
+            if _sz >= 1024 * 1024:
+                top_parts.append(f"{_lbl}={_sz / 1024.0 / 1024.0:.0f}MiB")
+            elif _sz >= 1024:
+                top_parts.append(f"{_lbl}={_sz / 1024.0:.0f}KiB")
+            else:
+                top_parts.append(f"{_lbl}={_sz}B")
+        top_str = " ".join(top_parts)
         _dbg.stderr.write(
             f"[dbg L{layer_idx:2d} arch={arch}] "
             f"shape={tuple(h.shape)} "
             f"mean={mean:+.3e} std={std:.3e} L2={l2:.1f} "
             f"row_cos={row_cos:+.3f} adj_max={adj_max:.3e} "
             f"cos_to_prev={cos_to_prev:+.3f} "
-            f"nan/inf={nan_inf_count} rss={_rss_mib():.0f}MiB\n"
+            f"nan/inf={nan_inf_count} rss={_rss_mib():.0f}MiB "
+            f"py={py_mib:.1f}MiB ndarr={n_arr} hidden={hidden_mib:.2f}MiB "
+            f"top=[{top_str}]\n"
         )
         _dbg.stderr.flush()
         # Always collect stats (when either --debug or --compare-layer
         # is on); the CLI decides whether to print, dump, or compare.
-        _record_layer_stats(idx, hidden, _prev_hidden, config.model_arch)
+        _record_layer_stats(layer_idx, h, prev_h, arch)
 
     def _record_layer_stats(
         layer_idx: int,
@@ -1353,7 +1557,13 @@ def make_qwen2_forwarder(
     ) -> np.ndarray:
         idx = layer.index
 
-        if idx == 0:
+        # Drive pre/post-layer gates from the scheduler's flags
+        # (``is_first`` / ``is_last``) rather than the model's
+        # original layer index. This is what lets custom selections
+        # like ``--layers=1,3,4,6,7,8`` work: the first selected
+        # layer embeds tokens, the last selected layer applies the
+        # final norm + LM head.
+        if handles.is_first:
             tokens = np.asarray(handles.tokens or [], dtype=np.int64)
             if tokens.size == 0:
                 raise ValueError("forward() called with no tokens bound")
@@ -1362,6 +1572,10 @@ def make_qwen2_forwarder(
             # instead of pinning the source tensor for the whole pass.
             state["embed"] = embed
             state["hidden"] = embed[tokens].astype(np.float32)
+            # Stash token ids so the per-token debug table can pair
+            # each row of the hidden state with its vocab id and
+            # decoded form.
+            state["tokens"] = tokens
 
         hidden = state["hidden"]
         assert hidden is not None
@@ -1376,10 +1590,53 @@ def make_qwen2_forwarder(
         nonlocal _prev_hidden
         if getattr(config, "debug_trace", False):
             _print_debug_stats(idx, hidden, _prev_hidden, config.model_arch)
+            # Per-token metrics for non-final layers. ``logits`` is
+            # None here so entropy / conf render as ``-``. The
+            # table is architecture-agnostic: it operates on the
+            # hidden state tensor, which has the same shape across
+            # Qwen2 / Qwen3 / Llama / Gemma / Qwen3.5.
+            _metrics = per_token_metrics(
+                hidden,
+                _prev_hidden,
+                tokens=state.get("tokens"),
+                logits=None,
+            )
+            print_per_token_table(
+                idx,
+                _metrics,
+                tokenizer=tokenizer,
+                max_rows=max_per_token_rows,
+                exclude_ids=exclude_token_ids,
+            )
+        # Prediction Evolution analyzer. At every layer we apply
+        # the final RMSNorm + LM head to the post-decode hidden
+        # state and feed the resulting logits to the analyzer. The
+        # analyzer deduplicates by ``layer``, so the autoregressive
+        # decode loop after the prompt prefill is a no-op. The
+        # norm and head are loaded from the manager (not the
+        # handles dict) because the scheduler only attaches the
+        # post-layer bookend to the last selected layer.
+        if analyzer is not None and not getattr(analyzer, "_frozen", False):
+            analyzer_logits = _compute_layer_logits(
+                hidden, handles, state, manager,
+            )
+            if analyzer_logits is not None:
+                analyzer.record(
+                    idx,
+                    analyzer_logits,
+                    tokens=state.get("tokens"),
+                    tokenizer=tokenizer,
+                )
         _prev_hidden = hidden
         state["hidden"] = hidden
 
-        if idx != last_index:
+        # The final norm + LM head fires on the last layer in
+        # *execution order*, not the last layer of the model.
+        # ``handles.is_last`` is the scheduler's view of execution
+        # order; ``final_layer_index`` is the explicit override
+        # path (used when the forwarder is driven outside the
+        # scheduler).
+        if not handles.is_last and idx != final_layer_index:
             return hidden
 
         # ----- Final norm + LM head, after the last block has run -----
@@ -1399,7 +1656,27 @@ def make_qwen2_forwarder(
                 dequant_cache=dequant_cache,
             )
             head_w = _as_linear(head_w, config.hidden_size, "lm_head")
-        return (hidden @ head_w.astype(np.float32).T).astype(np.float32)
+        logits = (hidden @ head_w.astype(np.float32).T).astype(np.float32)
+        if getattr(config, "debug_trace", False):
+            # Same per-token table, but with logits attached so the
+            # entropy and confidence columns are now populated.
+            # This is the only layer where these metrics are
+            # meaningful — the LM head isn't computed anywhere
+            # else in the forward path.
+            _metrics = per_token_metrics(
+                hidden,
+                _prev_hidden,
+                tokens=state.get("tokens"),
+                logits=logits,
+            )
+            print_per_token_table(
+                idx,
+                _metrics,
+                tokenizer=tokenizer,
+                max_rows=max_per_token_rows,
+                exclude_ids=exclude_token_ids,
+            )
+        return logits
 
     return forward
 

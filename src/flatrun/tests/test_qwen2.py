@@ -90,8 +90,11 @@ def _build_tiny_model(cfg: Qwen2Config):
     return handles
 
 
-def _handles_for_layer(handles, names: tuple[str, ...]) -> LayerHandles:
-    return LayerHandles({n: handles[n] for n in names}, names)
+def _handles_for_layer(handles, names: tuple[str, ...], *, is_first: bool = False, is_last: bool = False) -> LayerHandles:
+    lh = LayerHandles({n: handles[n] for n in names}, names)
+    lh.is_first = is_first
+    lh.is_last = is_last
+    return lh
 
 
 def _run_all_layers(cfg, forwarder, handles, tokens, kv) -> np.ndarray:
@@ -111,7 +114,7 @@ def _run_all_layers(cfg, forwarder, handles, tokens, kv) -> np.ndarray:
             names = names + ("model.norm.weight",)
             if not cfg.tie_word_embeddings:
                 names = names + ("lm_head.weight",)
-        lh = _handles_for_layer(handles, names)
+        lh = _handles_for_layer(handles, names, is_first=(i == 0), is_last=(i == last))
         if i == 0:
             lh.tokens = list(tokens)
         out = forwarder(LayerDescriptor(index=i, tensor_names=names), lh, kv)

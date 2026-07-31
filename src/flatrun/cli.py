@@ -92,7 +92,7 @@ _C_USER_END = "\033[0m"
 _C_ASSISTANT = "\033[32m"  # green  - "Assistant:" label
 _C_ASSISTANT_END = "\033[0m"
 _C_DIM = "\033[2m"          # dim
-_C_GREY = "\033[90m"        # bright-black - "grey" thinking body
+_C_GREY = "\033[97m"        # bright-white - "grey" thinking body (lighter than 90)
 _C_ITALIC = "\033[3m"       # italic  - thinking body
 _C_YELLOW = "\033[33m"     # yellow  - live cursor
 _C_END = "\033[0m"
@@ -223,6 +223,380 @@ class LiveCursor:
                 self._stream.flush()
             except Exception:
                 return
+            i += 1
+            time.sleep(_LIVE_CURSOR_INTERVAL)
+
+
+class LiveThinkingDisplay:
+    """Animated cursor + scrolling thinking content during streaming.
+
+    Renders a single line on stderr (the line lives right under the
+    streamed answer):
+
+        [yellow cursor] [dim]Thinking:[end] [grey italic]content[end]
+
+    ``feed_token`` is the streaming callback: it inspects each
+    decoded token, detects the ``<think ...>`` open and ``</think>``
+    close markers, and accumulates the body. The body grows
+    monotonically until it exceeds ``MAX_WORDS``; the OLDEST words
+    are only dropped once the buffer has cleared that threshold, so
+    short chains of thought stay visible in full.
+
+    Two design constraints drove the rendering strategy:
+
+    * **Don't flicker the line on every token.** Earlier iterations
+      rewrote the whole line with ``\\r\\x1b[K`` per token and the
+      user read that as "the thinking is always being cleared". The
+      new renderer paints the line once on activation, then **appends**
+      new chunks in place; the cursor tick only repaints the trailing
+      frame cell.
+    * **Don't show a fake Thinking line on non-reasoning models.**
+      Before the open tag is seen we paint a single placeholder
+      line - dim "Thinking:" + a literal "..." body - that pulses
+      without ever being rewritten. If the model never opens a
+      think block, ``__exit__`` simply blanks that one line.
+
+    The cursor cell and the content cell are physically separate, so
+    a tick that only swaps the braille frame never disturbs the
+    accumulated buffer.
+    """
+
+    OPEN_TAG = "<" + "think" + ">"
+    CLOSE_TAG = "<" + "/" + "think" + ">"
+    MAX_WORDS = 15  # 10-20 words before the window scrolls
+    PLACEHOLDER_BODY = "..."  # shown on the thinking line for non-reasoning models
+
+    def __init__(self, stream=None) -> None:
+        self._stream = stream or sys.stderr
+        self._thread = None
+        self._stop = False
+        self._raw_buffer = ""
+        self._content = ""
+        self._state = "before"  # before | thinking | after
+        self._lock = threading.Lock()
+        # ``_active`` distinguishes "we've painted the Thinking line"
+        # from "we haven't touched stderr yet". It is flipped on the
+        # first paint and never cleared mid-stream - the line stays
+        # live until ``__exit__`` blanks it.
+        self._active = False
+        # ``_rendered_len`` is the length of ``self._content`` (in
+        # characters) at the moment we last painted it. The per-token
+        # appender uses this to know which slice of ``_content`` is
+        # new and must be written after the cursor was last drawn.
+        self._rendered_len = 0
+        # ``_rendered_frame`` is the braille frame currently on screen
+        # at the cursor cell. The animation tick advances this in
+        # place without touching the content.
+        self._rendered_frame = _LIVE_CURSOR_FRAMES[0]
+        # ``_placeholder_on_screen`` is True while the live line shows
+        # the literal ``...`` placeholder (non-reasoning models, or
+        # the very first moments of a reasoning model before any
+        # body has arrived). The first time real content arrives, we
+        # must do one full rewrite to drop the placeholder - the
+        # appender otherwise would leave ``...real content`` on
+        # screen.
+        self._placeholder_on_screen = False
+
+    def __enter__(self) -> "LiveThinkingDisplay":
+        # Always start the animation thread: for non-reasoning models
+        # the placeholder line must still pulse. The thread itself
+        # gates on ``_active`` so the very first tick is the one that
+        # paints the placeholder.
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._stop = True
+        if self._thread is not None:
+            self._thread.join(timeout=_LIVE_CURSOR_INTERVAL * 3)
+        # If we ever painted the Thinking line, blank it so the
+        # next assistant turn starts on a clean slate. The
+        # transcript copy of the thinking block is printed by
+        # ``cmd_chat`` after the stream finishes, so we don't lose
+        # any reasoning by blanking the live view here.
+        if self._active:
+            with self._lock:
+                try:
+                    self._stream.write("\r\x1b[K")
+                    self._stream.flush()
+                except Exception:
+                    pass
+
+    def _activate(self) -> None:
+        """Paint the Thinking line the first time the line goes live.
+
+        This is called from the animation thread's first tick
+        (``_active`` flips from False to True and we paint in the
+        same critical section). It may also be called from
+        ``feed_token`` once the model emits ``<think ...>``, in
+        which case the animation thread has already painted the
+        placeholder - we just upgrade the body to the empty
+        (reasoning) state, which the next per-token append will
+        fill out.
+
+        NOTE: the caller MUST hold ``self._lock``.
+        """
+        if self._active:
+            return
+        self._active = True
+        self._rendered_frame = _LIVE_CURSOR_FRAMES[0]
+        self._placeholder_on_screen = True
+        try:
+            self._stream.write(
+                f"\n{_C_DIM}Thinking:{_C_END} "
+                f"{_C_GREY}{_C_ITALIC}{self.PLACEHOLDER_BODY}{_C_END}"
+                f"{_C_YELLOW}{self._rendered_frame}{_C_END}"
+            )
+            self._stream.flush()
+            self._rendered_len = len(self.PLACEHOLDER_BODY)
+        except Exception:
+            pass
+
+    def feed_token(self, text: str) -> None:
+        """Handle one decoded token from the streaming executor.
+
+        State machine:
+
+        * ``before`` - the open tag has not been seen yet. Text is
+          buffered rather than streamed straight to stdout, because
+          a token like ``<`` could be the start of ``<think ...>``.
+          Once the buffer is longer than the open tag and the tag
+          still isn't present, the buffered text is safe to flush.
+        * ``thinking`` - the open tag was seen, the close tag is not
+          yet. The body is the text between the open tag and the
+          end of the buffer, minus any prefix of the close tag that
+          might be forming at the tail. That body is appended to the
+          live line in place; once the word count exceeds
+          ``MAX_WORDS`` we do one full rewrite with the truncated
+          tail.
+        * ``after`` - the close tag was seen. Later tokens are the
+          assistant's reply and go to stdout.
+        """
+        import re as _re
+        self._raw_buffer += text
+        with self._lock:
+            if self._state == "before":
+                if self.OPEN_TAG in self._raw_buffer:
+                    open_idx = self._raw_buffer.index(self.OPEN_TAG)
+                    prefix = self._raw_buffer[:open_idx]
+                    if prefix:
+                        sys.stdout.write(prefix)
+                        sys.stdout.flush()
+                    # The model is reasoning - flip the live line on
+                    # if the animation thread hasn't already. We may
+                    # already have the placeholder on screen; that
+                    # is fine, the first append below will start
+                    # appending the real reasoning right after it.
+                    self._activate()
+                    self._flush_to_thinking_or_after()
+                elif (
+                    len(self._raw_buffer) < len(self.OPEN_TAG)
+                    and self.OPEN_TAG.startswith(self._raw_buffer)
+                ):
+                    # Buffer is a prefix of the open tag - hold it
+                    # silently until the next token tells us whether
+                    # the model is actually reasoning. This is the
+                    # ONE place we delay the stream: the only case
+                    # where the buffered text could grow into
+                    # ``<think ...>``.
+                    pass
+                else:
+                    # Buffer is either longer than the open tag, or
+                    # it can no longer grow into the open tag - in
+                    # both cases it's safe to flush to stdout
+                    # immediately. Non-reasoning models never
+                    # trigger the prefix branch above, so their
+                    # tokens flow straight to the terminal as
+                    # ``sys.stdout.write`` per token. The live
+                    # Thinking line is already on screen with its
+                    # placeholder body, and will be blanked on
+                    # ``__exit__``.
+                    sys.stdout.write(self._raw_buffer)
+                    sys.stdout.flush()
+                    self._raw_buffer = ""
+            elif self._state == "thinking":
+                if self.CLOSE_TAG in self._raw_buffer:
+                    self._extract_thinking()
+                    self._state = "after"
+                    close_idx = self._raw_buffer.index(self.CLOSE_TAG) + len(self.CLOSE_TAG)
+                    tail = self._raw_buffer[close_idx:]
+                    if tail:
+                        sys.stdout.write(tail)
+                        sys.stdout.flush()
+                    self._raw_buffer = ""
+                else:
+                    open_idx = self._raw_buffer.index(self.OPEN_TAG) + len(self.OPEN_TAG)
+                    body = self._raw_buffer[open_idx:]
+                    # Strip any prefix of the close tag that is
+                    # forming at the tail so the live display never
+                    # shows ``</`` or ``</think`` as part of the
+                    # thinking content.
+                    for i in range(len(self.CLOSE_TAG), 0, -1):
+                        if body.endswith(self.CLOSE_TAG[:i]):
+                            body = body[:-i]
+                            break
+                    self._content = _re.sub(r"\s+", " ", body).strip()
+                    # Truncate by word count: keep the most recent
+                    # ``MAX_WORDS`` words once the buffer has
+                    # cleared the threshold. Splitting on whitespace
+                    # is fine here because ``_re.sub(r"\s+", " ", ...)``
+                    # above already collapsed runs of whitespace into
+                    # a single space. Short chains of thought never
+                    # hit the truncation branch and stay visible in
+                    # full.
+                    words = self._content.split(" ")
+                    if len(words) > self.MAX_WORDS:
+                        new_content = " ".join(words[-self.MAX_WORDS :])
+                        # Truncation requires a full rewrite of the
+                        # live line - the only place we still use
+                        # ``\r\x1b[K``. This is rare (the buffer
+                        # has to clear MAX_WORDS first) so it does
+                        # not look like the line is being cleared
+                        # per token.
+                        self._content = new_content
+                        self._full_render()
+                    else:
+                        # The buffer is still inside the word budget.
+                        # Only append the slice that hasn't been
+                        # painted yet - this is what stops the line
+                        # from flickering per token.
+                        self._append_render()
+            else:  # after
+                sys.stdout.write(text)
+                sys.stdout.flush()
+
+    def _flush_to_thinking_or_after(self) -> None:
+        """After the open tag is in the buffer, decide between
+        ``thinking`` and ``after`` based on whether the close tag is
+        already present too.
+        """
+        after_open = self._raw_buffer[
+            self._raw_buffer.index(self.OPEN_TAG) + len(self.OPEN_TAG) :
+        ]
+        if self.CLOSE_TAG in after_open:
+            self._extract_thinking()
+            self._state = "after"
+            close_idx = self._raw_buffer.index(self.CLOSE_TAG) + len(self.CLOSE_TAG)
+            tail = self._raw_buffer[close_idx:]
+            if tail:
+                sys.stdout.write(tail)
+                sys.stdout.flush()
+            self._raw_buffer = ""
+        else:
+            self._state = "thinking"
+
+    def _extract_thinking(self) -> None:
+        import re as _re
+        start = self._raw_buffer.index(self.OPEN_TAG) + len(self.OPEN_TAG)
+        end = self._raw_buffer.index(self.CLOSE_TAG)
+        body = self._raw_buffer[start:end]
+        body = _re.sub(r"\s+", " ", body).strip()
+        words = body.split(" ")
+        if len(words) > self.MAX_WORDS:
+            body = " ".join(words[-self.MAX_WORDS :])
+        self._content = body
+        # Whole block arrived in one shot - one full render is fine.
+        self._full_render()
+
+    def _full_render(self) -> None:
+        """Repaint the entire thinking line. Used when truncation
+        happens or when the placeholder line first transitions to
+        real content.
+        """
+        self._placeholder_on_screen = False
+        try:
+            self._stream.write(
+                f"\r\x1b[K{_C_DIM}Thinking:{_C_END} "
+                f"{_C_GREY}{_C_ITALIC}{self._content}{_C_END}"
+                f"{_C_YELLOW}{self._rendered_frame}{_C_END}"
+            )
+            self._stream.flush()
+            self._rendered_len = len(self._content)
+        except Exception:
+            pass
+
+    def _append_render(self) -> None:
+        """Append only the freshly accumulated characters onto the
+        live line, then advance the cursor cell.
+
+        The streaming cursor is already at the end of the line after
+        the previous paint - either just after the body or just after
+        the cursor frame, depending on whether the animation thread
+        has ticked since the last paint. We rewind one cell (so the
+        new write lands on top of the old cursor frame, not after
+        it) and emit ``<new chunk><updated cursor frame>``.
+
+        If the placeholder is still on screen and the body now has
+        real content, fall back to a full rewrite - the appender
+        would otherwise leave ``...real content`` visible.
+        """
+        if self._placeholder_on_screen and self._content:
+            self._full_render()
+            return
+        new_chars = self._content[self._rendered_len :]
+        if not new_chars:
+            # The buffer might have been collapsed by whitespace
+            # normalisation without gaining any visible characters.
+            # Still need to advance the cursor cell so it doesn't
+            # freeze on an old frame.
+            self._advance_cursor()
+            return
+        try:
+            # ``\b`` rewinds one column so the new write overwrites
+            # the trailing cursor frame rather than appending past
+            # it. The grey italic run is closed (back to default
+            # attributes) at the end of the body chunk so the yellow
+            # cursor frame keeps its colour.
+            self._stream.write(
+                f"\b{_C_GREY}{_C_ITALIC}{new_chars}{_C_END}"
+                f"{_C_YELLOW}{self._rendered_frame}{_C_END}"
+            )
+            self._stream.flush()
+            self._rendered_len += len(new_chars)
+        except Exception:
+            pass
+
+    def _advance_cursor(self) -> None:
+        """Rewrite just the trailing cursor frame, leaving the
+        content untouched. Cheap enough to run on every animation
+        tick (the buffer is empty so we only emit two bytes).
+        """
+        try:
+            self._stream.write(
+                f"\b{_C_YELLOW}{self._rendered_frame}{_C_END}"
+            )
+            self._stream.flush()
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        i = 0
+        # First tick: flip the line live if it isn't already. This
+        # is what makes the placeholder appear at the start of
+        # generation - we don't have to know in advance whether the
+        # model is reasoning or not.
+        first_tick = True
+        while not self._stop:
+            frame = _LIVE_CURSOR_FRAMES[i % len(_LIVE_CURSOR_FRAMES)]
+            with self._lock:
+                if first_tick:
+                    first_tick = False
+                    # If ``feed_token`` already activated the line
+                    # before the thread got its first tick, do
+                    # nothing extra here - the placeholder is
+                    # already on screen.
+                    if not self._active:
+                        self._activate()
+                        # Skip this tick's frame advance; the
+                        # cursor was just painted.
+                        i += 1
+                        time.sleep(_LIVE_CURSOR_INTERVAL)
+                        continue
+                if frame != self._rendered_frame:
+                    self._rendered_frame = frame
+                    self._advance_cursor()
             i += 1
             time.sleep(_LIVE_CURSOR_INTERVAL)
 
@@ -582,7 +956,38 @@ def _build_argparser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser
         action="store_true",
         help="Print per-layer hidden-state norms and position-collapse "
              "metrics to stderr. Useful for cross-checking a model's "
-             "forwarder against a reference (LM Studio, llama.cpp).",
+             "forwarder against a reference (LM Studio, llama.cpp). "
+             "With --debug, the CLI also emits a per-token debug "
+             "table per layer and a Layer Analysis Summary at the "
+             "end of inference.",
+    )
+    shared.add_argument(
+        "--debug-include-special",
+        action="store_true",
+        help="When set with --debug, special tokens (BOS, EOS, chat "
+             "markers, ...) are shown in the per-token debug table. "
+             "By default they are filtered out so the table focuses "
+             "on content tokens.",
+    )
+    shared.add_argument(
+        "--debug-save-analysis",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Write the Layer Analysis Summary (per-layer scores, "
+             "most active / most stable ranks, suggested early-exit "
+             "and suggested layer subset) to PATH as JSON. Useful "
+             "for cross-prompt research on selective layer execution. "
+             "Implies --debug.",
+    )
+    shared.add_argument(
+        "--debug-max-token-rows",
+        type=int,
+        default=16,
+        metavar="N",
+        help="Maximum number of tokens to show in the per-token "
+             "debug table per layer (default 16). Set higher to "
+             "inspect every token in long prompts.",
     )
     shared.add_argument(
         "--dequant-cache",
@@ -625,6 +1030,32 @@ def _build_argparser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser
         help="Tolerance for --compare-layer. A layer is flagged when "
              "any relative divergence exceeds this fraction. Default 0.05 "
              "(5 percent).",
+    )
+    shared.add_argument(
+        "--max-layers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Use only the first N decoder layers. Equivalent to "
+             "running a truncated-depth copy of the model: the first N "
+             "layers run in order, embeddings are loaded with the first "
+             "selected layer, and the final norm + LM head fire on the "
+             "Nth selected layer. Mutually exclusive with --layers.",
+    )
+    shared.add_argument(
+        "--layers",
+        type=str,
+        default=None,
+        metavar="LIST",
+        help="Run a custom subset of decoder layers in the given order. "
+             "Accepts a comma-separated list of 0-indexed indices and "
+             "inclusive ranges, e.g. '1,3,4,6,7,8' or '0-6,19-24,34-39'. "
+             "Whitespace is ignored. Duplicates are removed while "
+             "preserving order. The hidden state passes through the "
+             "selected layers in order; unlisted layers are skipped. The "
+             "first selected layer embeds tokens and the last selected "
+             "layer applies the final norm + LM head. Mutually exclusive "
+             "with --max-layers.",
     )
 
     parser = argparse.ArgumentParser(
@@ -751,6 +1182,131 @@ def _pick_gguf_file(model_dir: Path, parser: argparse.ArgumentParser) -> Path:
     return candidates[0]
 
 
+def _parse_layer_spec(spec: str) -> list[int]:
+    """Parse a ``--layers`` spec into a list of layer indices.
+
+    The spec is a comma-separated list where each element is either a
+    single integer (``"3"``) or an inclusive range (``"3-7"``).
+    Whitespace is stripped. Duplicates are dropped while preserving
+    order. Examples::
+
+        "1,3,4,6,7,8"       -> [1, 3, 4, 6, 7, 8]
+        "0-6,19-24,34-39"   -> [0, 1, 2, 3, 4, 5, 6, 19, ..., 39]
+        "1,3-4,6,7-8"       -> [1, 3, 4, 6, 7, 8]
+        "5-5"               -> [5]   (degenerate single-element range)
+
+    Raises :class:`ConfigurationError` on malformed input.
+    """
+    if not spec or not spec.strip():
+        raise ConfigurationError("--layers must be a non-empty list")
+
+    indices: list[int] = []
+    seen: set[int] = set()
+    for token in spec.split(","):
+        piece = token.strip()
+        if not piece:
+            raise ConfigurationError(
+                f"--layers contains an empty entry in {spec!r}"
+            )
+        if "-" in piece:
+            # Inclusive range. Split on the first dash so negative
+            # numbers can be expressed if we ever need them (-1 is
+            # not a valid layer index for our models, but the parser
+            # is forgiving).
+            head, sep, tail = piece.partition("-")
+            if not head or not tail or sep != "-":
+                raise ConfigurationError(
+                    f"--layers range {piece!r} is malformed; expected "
+                    f"'FROM-TO' with both integers"
+                )
+            try:
+                start = int(head)
+                end = int(tail)
+            except ValueError as exc:
+                raise ConfigurationError(
+                    f"--layers range {piece!r} has non-integer bounds: {exc}"
+                ) from exc
+            if start > end:
+                raise ConfigurationError(
+                    f"--layers range {piece!r} is reversed "
+                    f"({start} > {end})"
+                )
+            for idx in range(start, end + 1):
+                if idx not in seen:
+                    seen.add(idx)
+                    indices.append(idx)
+        else:
+            try:
+                idx = int(piece)
+            except ValueError as exc:
+                raise ConfigurationError(
+                    f"--layers entry {piece!r} is not an integer: {exc}"
+                ) from exc
+            if idx not in seen:
+                seen.add(idx)
+                indices.append(idx)
+    if not indices:
+        raise ConfigurationError(f"--layers {spec!r} produced no indices")
+    return indices
+
+
+def _select_layers(
+    manifest_layers: tuple,
+    *,
+    max_layers: int | None,
+    layers_spec: str | None,
+) -> tuple:
+    """Apply ``--max-layers`` / ``--layers`` to a manifest's layer list.
+
+    Returns the resulting tuple of :class:`LayerDescriptor` objects in
+    execution order.
+
+    Both flags are mutually exclusive. With neither flag set the
+    full layer list is returned unchanged. Duplicates in ``--layers``
+    are de-duplicated while preserving order so ``1,3,3,4`` is
+    treated as ``1,3,4``. Ranges are written as ``FROM-TO`` and
+    expand inclusively — ``0-6,19-24,34-39`` is equivalent to
+    listing every index in those ranges.
+
+    The intent is to support depth-bounded inference (``--max-layers``)
+    and ablation-style subset inference (``--layers``) without
+    duplicating the index-based ``idx == 0`` / ``idx == last``
+    logic that the Qwen2 forwarder would otherwise need. The
+    scheduler flags the first and last *selected* layer via
+    ``LayerHandles.is_first`` / ``is_last`` so the forwarder can
+    decide when to embed tokens and when to apply the final norm +
+    LM head.
+    """
+    if max_layers is not None and layers_spec is not None:
+        raise ConfigurationError(
+            "--max-layers and --layers are mutually exclusive; "
+            "pass only one."
+        )
+    if max_layers is not None:
+        if max_layers <= 0:
+            raise ConfigurationError(
+                f"--max-layers must be a positive integer, got {max_layers}"
+            )
+        if max_layers > len(manifest_layers):
+            raise ConfigurationError(
+                f"--max-layers={max_layers} exceeds the model's "
+                f"{len(manifest_layers)} layers"
+            )
+        return tuple(manifest_layers[:max_layers])
+    if layers_spec is not None:
+        indices = _parse_layer_spec(layers_spec)
+        available = {layer.index for layer in manifest_layers}
+        for idx in indices:
+            if idx not in available:
+                raise ConfigurationError(
+                    f"--layers references layer {idx}, which is not in "
+                    f"the manifest (have {sorted(available)})"
+                )
+        layer_map = {layer.index: layer for layer in manifest_layers}
+        return tuple(layer_map[idx] for idx in indices)
+    return tuple(manifest_layers)
+
+
 def _load_model_bundle(args, parser: argparse.ArgumentParser) -> dict:
     """Open the model, return a dict with everything both handlers need.
 
@@ -850,12 +1406,71 @@ def _load_model_bundle(args, parser: argparse.ArgumentParser) -> dict:
         qcfg.quant_gguf = None
         qcfg.debug_trace = args.debug
     enable_cache = args.dequant_cache == "on"
-    forwarder = make_qwen2_forwarder(qcfg, enable_dequant_cache=enable_cache, memory_trace=args.memory_trace)
-
-    scheduler = loaded.runtime.build_scheduler(
+    selected_layers = _select_layers(
         loaded.manifest.layers,
+        max_layers=args.max_layers,
+        layers_spec=args.layers,
+    )
+    if len(selected_layers) != len(loaded.manifest.layers):
+        if args.layers is not None:
+            print(
+                f"Selected layers (custom order): "
+                f"{[l.index for l in selected_layers]}"
+            )
+        else:
+            print(
+                f"Using first {len(selected_layers)} of "
+                f"{len(loaded.manifest.layers)} layers"
+            )
+    # ``last_index`` for the forwarder is the *original* index of the
+    # last selected layer. The scheduler's ``is_last`` flag is the
+    # authoritative gate at runtime, but ``last_index`` is the
+    # fallback for callers that drive the forwarder outside the
+    # scheduler.
+    final_layer_index = (
+        selected_layers[-1].index
+        if len(selected_layers) != len(loaded.manifest.layers)
+        else None
+    )
+
+    # Special-token IDs come from the tokenizer's added-token table.
+    # When the user opts in via ``--debug-include-special`` we pass
+    # ``None`` so the per-token debug table shows every token. The
+    # analyzer is created only when the user enabled debug-style
+    # output (either ``--debug`` or ``--debug-save-analysis``).
+    debug_enabled = args.debug or args.debug_save_analysis is not None
+    exclude_token_ids = (
+        None
+        if args.debug_include_special
+        else set(int(tid) for tid in getattr(tokenizer, "added_tokens", {}).keys())
+    )
+
+    # Build the scheduler first so the analyzer and forwarder can
+    # take its ``manager`` — the prediction-evolution analyzer needs
+    # to load ``model.norm.weight`` and ``lm_head.weight`` at every
+    # layer, not just the last, and those live in the post-layer
+    # bookend that the scheduler attaches to the last selected layer.
+    scheduler = loaded.runtime.build_scheduler(
+        selected_layers,
         pre_layer_names=loaded.manifest.pre_layer,
         post_layer_names=loaded.manifest.post_layer,
+    )
+
+    analyzer = None
+    if debug_enabled:
+        from flatrun.utils.debug import PredictionAnalyzer
+        analyzer = PredictionAnalyzer(layer_count=len(selected_layers))
+
+    forwarder = make_qwen2_forwarder(
+        qcfg,
+        enable_dequant_cache=enable_cache,
+        memory_trace=args.memory_trace,
+        last_index=final_layer_index,
+        tokenizer=tokenizer,
+        max_per_token_rows=args.debug_max_token_rows,
+        exclude_token_ids=exclude_token_ids,
+        analyzer=analyzer,
+        manager=scheduler.manager,
     )
     executor = StreamingExecutor(scheduler, forwarder, kv_cache=KVCache(capacity=4096))
 
@@ -867,6 +1482,7 @@ def _load_model_bundle(args, parser: argparse.ArgumentParser) -> dict:
         "forwarder": forwarder,
         "executor": executor,
         "qcfg": qcfg,
+        "analyzer": analyzer,
     }
 
 
@@ -1014,9 +1630,30 @@ def cmd_run(args) -> int:
         for tid in sorted(top_indices, key=lambda i: -logits[-1, i]):
             print(f"  id={tid:6d} logit={logits[-1, tid]:8.2f}  text={tokenizer.decode([tid])!r}")
 
+    _finalize_analyzer(bundle, args)
     bundle["loaded"].runtime.close()
     print("Done.")
     return 0
+
+
+def _finalize_analyzer(bundle: dict, args) -> None:
+    """Print the layer analysis summary and persist JSON if requested.
+
+    Called from the bottom of ``cmd_run`` and ``cmd_chat``. The
+    analyzer is None when debug-style output was not enabled, so
+    this is a no-op in that case.
+    """
+    analyzer = bundle.get("analyzer")
+    if analyzer is None:
+        return
+    # Freeze so the autoregressive decode loop's repeated forwards
+    # don't accumulate stats (the trigger is the existence of the
+    # analyzer; the first forward pass has already populated it).
+    analyzer.freeze()
+    analyzer.summarize()
+    if args.debug_save_analysis is not None:
+        path = analyzer.save(args.debug_save_analysis)
+        print(f"Layer analysis saved to {path}")
 
 
 def cmd_chat(args) -> int:
@@ -1084,12 +1721,22 @@ def cmd_chat(args) -> int:
         # ``_print_thinking``) rather than next to the streamed
         # content - the LiveCursor rewrite-the-cursor-cell-via-\r
         # approach was eating the streamed transcript.
+        # The animated yellow cursor and the scrolling thinking
+        # content live on a reserved row at the bottom of the
+        # terminal (row 999), so they never overwrite the streamed
+        # reply on stdout. ``LiveThinkingDisplay`` is the stream
+        # callback: it inspects each decoded token, detects the
+        # ``<think ...>`` / ``<think ...>`` markers, accumulates the
+        # body into a scrolling buffer (kept visible until it
+        # exceeds ~20 tokens, then truncated to the tail), and
+        # forwards the rest of the stream to stdout unchanged.
         sys.stdout.write(f"{_C_ASSISTANT}Assistant:{_C_ASSISTANT_END}\n")
         sys.stdout.flush()
-        generated, _, _ = _generate_continuation(
-            bundle, args, prompt_ids, args.max_new,
-            stream=lambda t: print(t, end="", flush=True),
-        )
+        with LiveThinkingDisplay() as td:
+            generated, _, _ = _generate_continuation(
+                bundle, args, prompt_ids, args.max_new,
+                stream=td.feed_token,
+            )
         print()  # newline after the streamed reply
         dt = time.perf_counter() - t0
         raw_text = tokenizer.decode(generated)
@@ -1111,12 +1758,15 @@ def cmd_chat(args) -> int:
                 f"{_C_DIM}Thinking:{_C_END} "
                 f"{_C_GREY}{_C_ITALIC}{thinking}{_C_END}"
             )
-        # ``Assistant:`` in green; the streamed reply is already on
-        # the line above so we just print it here for the REPL log.
-        print(f"{_C_ASSISTANT}Assistant: {reply_text}{_C_ASSISTANT_END}")
+        # The reply tokens were already streamed to stdout by
+        # ``LiveThinkingDisplay.feed_token`` during the ``with``
+        # block. Do NOT re-print the reply text here - that would
+        # race the streamed output and look like the assistant
+        # waited for ``max_new`` before speaking.
         print(f"  ({len(generated)} tokens, {dt:.1f}s, {len(generated) / max(dt, 1e-3):.1f} tok/s)\n")
         messages.append({"role": "assistant", "content": reply_text})
 
+    _finalize_analyzer(bundle, args)
     bundle["loaded"].runtime.close()
     return 0
 
