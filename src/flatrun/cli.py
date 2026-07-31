@@ -492,6 +492,29 @@ def _build_argparser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser
              "and KV cache size after every decoder block. Use with "
              "--dequant-cache off to verify streaming behaviour.",
     )
+    shared.add_argument(
+        "--compare-layer",
+        type=str,
+        default=None,
+        metavar="REF_JSON",
+        help="Compare per-layer hidden-state statistics against a "
+             "reference JSON (output of --debug, captured from LM "
+             "Studio, llama.cpp, or HF transformers). Dumps FlatRun's "
+             "per-layer stats to <path>.flatrun.json and reports the "
+             "first layer where any of mean / std / L2 / cos_to_prev / "
+             "row_cos diverges by more than the configured tolerance. "
+             "Use this to localise where the forwarder drifts from "
+             "a reference runtime without manually diffing the trace.",
+    )
+    shared.add_argument(
+        "--compare-tol",
+        type=float,
+        default=0.05,
+        metavar="TOL",
+        help="Tolerance for --compare-layer. A layer is flagged when "
+             "any relative divergence exceeds this fraction. Default 0.05 "
+             "(5 percent).",
+    )
 
     parser = argparse.ArgumentParser(
         prog="flatrun",
@@ -708,8 +731,21 @@ def _generate_continuation(
     args,
     prompt_ids: list[int],
     max_new: int,
+    *,
+    stream: "typing.Callable[[str], None] | None" = None,
 ) -> tuple[list[int], np.ndarray | None, list[float]]:
-    """Run the forwarder ``max_new`` times, return (ids, last_logits, step_times)."""
+    """Run the forwarder ``max_new`` times and return (ids, last_logits, step_times).
+
+    If ``stream`` is supplied, each newly sampled token is written to
+    ``stream(text)`` immediately - typically ``sys.stdout.write`` so
+    the user sees the response grow token-by-token, the way Claude
+    Code's console streams an answer rather than waiting for the
+    full generation. The Spinner from earlier versions is gone;
+    progress visibility now comes from the ``[dbg]`` lines on
+    stderr (one line per layer, never replaced via ``\\r``) and
+    from the in-place token stream on stdout.
+    """
+    import typing
     executor = bundle["executor"]
     tokenizer = bundle["tokenizer"]
     sampler = _make_sampler(args)
@@ -719,25 +755,36 @@ def _generate_continuation(
     next_id = -1
     generated: list[int] = []
 
-    with Spinner("Thinking"):
-        for nxt in range(max_new):
-            ids = prompt_ids + generated if next_id == -1 else prompt_ids + generated
-            t0 = time.perf_counter()
-            result = executor.step(tokens=ids)
-            step_times.append((time.perf_counter() - t0) * 1000)
-            if nxt == 0 and args.profile:
-                print(f"  initial step: {step_times[-1]:.0f} ms ({len(ids)} tokens)")
-            elif args.profile:
-                print(f"  step {nxt + 1}: {step_times[-1]:.0f} ms ({len(ids)} tokens)")
-            logits = result.last_hidden
-            if args.no_sample:
-                next_id = int(np.argmax(logits[-1]))
-            else:
-                next_id = sampler.sample(logits[-1], seen_ids=seen)
-            generated.append(next_id)
-            seen.append(next_id)
+    write_token = stream if stream is not None else (lambda _t: None)
+    flush_token = (lambda: None) if stream is None else (lambda: stdout_token_flush())
+
+    for nxt in range(max_new):
+        ids = prompt_ids + generated if next_id == -1 else prompt_ids + generated
+        t0 = time.perf_counter()
+        result = executor.step(tokens=ids)
+        step_times.append((time.perf_counter() - t0) * 1000)
+        if nxt == 0 and args.profile:
+            print(f"  initial step: {step_times[-1]:.0f} ms ({len(ids)} tokens)")
+        elif args.profile:
+            print(f"  step {nxt + 1}: {step_times[-1]:.0f} ms ({len(ids)} tokens)")
+        logits = result.last_hidden
+        if args.no_sample:
+            next_id = int(np.argmax(logits[-1]))
+        else:
+            next_id = sampler.sample(logits[-1], seen_ids=seen)
+        generated.append(next_id)
+        seen.append(next_id)
+        # Stream the new token to the caller. ``flush_token`` lets the
+        # caller batch ``write`` calls (useful for chat where we
+        # already print a ``Assistant:`` prefix on the same line).
+        write_token(tokenizer.decode([next_id]))
+        flush_token()
 
     return generated, logits, step_times
+
+
+def stdout_token_flush() -> None:
+    sys.stdout.flush()
 
 
 def cmd_run(args) -> int:
@@ -768,9 +815,17 @@ def cmd_run(args) -> int:
     )
 
     print(f"\nRunning initial step with {len(prompt_ids)} prompt tokens ...")
+    print("Generated: ", end="", flush=True)
+    # ``stream`` writes each new token to stdout as it's sampled, so
+    # the user sees the response grow in place rather than waiting
+    # for the whole ``--max-new`` budget to finish. The newline is
+    # printed in :func:`cmd_run` after the last token, not here, so
+    # chat-mode callers can put their own prefix on the same line.
     generated, logits, step_times = _generate_continuation(
-        bundle, args, prompt_ids, args.max_new
+        bundle, args, prompt_ids, args.max_new,
+        stream=lambda t: print(t, end="", flush=True),
     )
+    print()  # newline after the streamed token sequence
     raw_text = tokenizer.decode(generated)
     for nxt, tid in enumerate(generated):
         print(f"  token {nxt + 1}: id={tid} text={tokenizer.decode([tid])!r}")
@@ -861,9 +916,15 @@ def cmd_chat(args) -> int:
         bundle["executor"].kv_cache.reset()
         turn += 1
         t0 = time.perf_counter()
+        # Print "Assistant: " once, then stream tokens onto the same
+        # line. ``--no-sample`` and ``--temperature`` etc. are honoured
+        # by ``_make_sampler`` inside ``_generate_continuation``.
+        print("Assistant: ", end="", flush=True)
         generated, _, _ = _generate_continuation(
-            bundle, args, prompt_ids, args.max_new
+            bundle, args, prompt_ids, args.max_new,
+            stream=lambda t: print(t, end="", flush=True),
         )
+        print()  # newline after the streamed reply
         dt = time.perf_counter() - t0
         raw_text = tokenizer.decode(generated)
         thinking, reply_text = _split_thinking(raw_text)
