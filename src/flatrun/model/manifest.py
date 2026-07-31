@@ -20,16 +20,25 @@ from ..utils.types import LayerDescriptor, TensorKey
 
 
 # Default regex for decoder layers in HuggingFace checkpoints.
-DEFAULT_LAYER_PATTERN = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
+# Qwen3.5 multimodal checkpoints nest the text decoder under a
+# leading ``language_model.`` segment. The optional ``<segment>.`` prefix
+# accommodates that without breaking single-segment text models.
+DEFAULT_LAYER_PATTERN = re.compile(r"^(?:[^.]+\.)?model\.layers\.(\d+)\.(.+)$")
 
 # Tensors that always live outside any one layer. FlatRun splits them
 # into a "pre" bookend (loaded with the first layer) and a "post"
-# bookend (loaded with the last layer).
+# bookend (loaded with the last layer). Both the bare ``model.``
+# naming and the ``language_model.model.`` prefix used by Qwen3.5
+# multimodal checkpoints are accepted.
 DEFAULT_PRE_LAYER_TENSORS = (
     "model.embed_tokens.weight",
     "model.embed_tokens.biases",
     "model.embed_tokens.scales",
     "model.rotary_emb.inv_freq",
+    "language_model.model.embed_tokens.weight",
+    "language_model.model.embed_tokens.biases",
+    "language_model.model.embed_tokens.scales",
+    "language_model.model.rotary_emb.inv_freq",
 )
 
 DEFAULT_POST_LAYER_TENSORS = (
@@ -38,6 +47,11 @@ DEFAULT_POST_LAYER_TENSORS = (
     "lm_head.bias",
     "lm_head.biases",
     "lm_head.scales",
+    "language_model.model.norm.weight",
+    "language_model.lm_head.weight",
+    "language_model.lm_head.bias",
+    "language_model.lm_head.biases",
+    "language_model.lm_head.scales",
 )
 
 

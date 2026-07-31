@@ -26,6 +26,7 @@ and llama.cpp's Q8_1-quantised activations.
 | SmolLM2-360M-Instruct | `smollm2-360m-instruct-q8_0.gguf` | ✅ | NORM RoPE |
 | Qwen3-0.6B | `Qwen3-0.6B-Q4_K_M.gguf` | ✅ | per-head q/k norm |
 | Bonsai-1.7B | `Bonsai-1.7B-Q1_0.gguf` | ✅ | 1-bit, 1.125 bpw |
+| Qwen3.5-0.8B MLX-4bit | `Qwen3.5-0.8B-MLX-4bit` | ⚠️ partial | Architecture decoded, full-attention path implemented; **DeltaNet linear-attention raises NotImplementedError** on first linear layer. |
 
 ## Requantised (K-quants produced locally for decoder testing)
 

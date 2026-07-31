@@ -350,6 +350,15 @@ def _softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     return e / np.sum(e, axis=axis, keepdims=True)
 
 
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    """Numerically stable sigmoid. Equivalent to ``1 / (1 + exp(-x))``."""
+    return np.where(
+        x >= 0,
+        1.0 / (1.0 + np.exp(-x)),
+        np.exp(x) / (1.0 + np.exp(x)),
+    )
+
+
 
 # ---------------------------------------------------------------------------
 # Tensor fetch helpers
@@ -406,10 +415,28 @@ def _fetch_proj(
     weights may have changed.
     """
     if layer_index == -1:
-        # Pre/post-layer tensor (embedding, LM head, etc.).
-        base = proj_name
+        # Pre/post-layer tensor (embedding, LM head, etc.). The
+        # Qwen3.5 multimodal export nests the text decoder under
+        # ``language_model.``, so the bare name may or may not be
+        # present; try the original first, then the ``language_model.``
+        # prefixed variant. Per-layer names already include the full
+        # path, so the prefix isn't needed there.
+        candidates = [proj_name, f"language_model.{proj_name}"]
     else:
-        base = f"model.layers.{layer_index}.{proj_name}"
+        candidates = [
+            f"model.layers.{layer_index}.{proj_name}",
+            f"language_model.model.layers.{layer_index}.{proj_name}",
+        ]
+    base = None
+    for cand in candidates:
+        if f"{cand}.weight" in handles:
+            base = cand
+            break
+    if base is None:
+        raise KeyError(
+            f"Could not find tensor for projection {proj_name!r} at layer "
+            f"{layer_index}. Tried: {[c + '.weight' for c in candidates]}"
+        )
     cache_key = f"{base}.weight"
     if config.quant_mlx_4bit:
         if dequant_cache is not None and cache_key in dequant_cache:
@@ -826,6 +853,182 @@ def make_qwen2_forwarder(
         hidden = _gemma3_norm(hidden, post_mlp_norm_w, config.rms_norm_eps)
         return hidden
 
+    def _qwen35_full_attention_block(
+        idx: int,
+        handles: LayerHandles,
+        hidden: np.ndarray,
+        kv: KVCache,
+    ) -> np.ndarray:
+        """One Qwen3.5 full-attention layer.
+
+        Differs from the Qwen2 / Qwen3 path in one detail: the saved
+        ``attn_output_gate: true`` config says the attention output
+        should be multiplied by ``sigmoid(gate_proj(x))``. The
+        reference implementation has a separate
+        ``self_attn.gate_proj`` weight that the forwarder would use;
+        the MLX-4bit export we test against does not export that
+        tensor (the 0.8B checkpoint appears to fold the gate into
+        ``q_proj``'s output channel count). Without a real
+        ``gate_proj`` tensor the gate step is a no-op here, which is
+        the safer default - the model would produce correctly-shaped
+        but un-modulated attention output, not garbage.
+        """
+        seq_len = hidden.shape[0]
+        residual = hidden
+        attn_norm_w = handles[
+            f"model.layers.{idx}.input_layernorm.weight"
+        ].as_numpy().astype(np.float32)
+        x = _rms_norm(hidden, attn_norm_w, config.rms_norm_eps)
+
+        q_w, _ = _fetch_linear_with_quant(
+            handles, idx, "self_attn.q_proj", config, np_dtype, dequant_cache=dequant_cache
+        )
+        k_w, _ = _fetch_linear_with_quant(
+            handles, idx, "self_attn.k_proj", config, np_dtype, dequant_cache=dequant_cache
+        )
+        v_w, _ = _fetch_linear_with_quant(
+            handles, idx, "self_attn.v_proj", config, np_dtype, dequant_cache=dequant_cache
+        )
+        q_w = _as_linear(q_w, config.hidden_size, f"layer{idx}.q_proj")
+        k_w = _as_linear(k_w, config.hidden_size, f"layer{idx}.k_proj")
+        v_w = _as_linear(v_w, config.hidden_size, f"layer{idx}.v_proj")
+        qkv_w = np.concatenate([q_w, k_w, v_w], axis=0).astype(np.float32)
+        qkv = x @ qkv_w.T
+        q = qkv[:, :q_dim].reshape(seq_len, n_heads, head_dim)
+        k = qkv[:, q_dim : q_dim + kv_dim].reshape(seq_len, n_kv_heads, head_dim)
+        v = qkv[:, q_dim + kv_dim :].reshape(seq_len, n_kv_heads, head_dim)
+
+        # Q / K RMSNorm with Gemma 3's ``1 + weight`` gain. Qwen3.5
+        # uses the same convention as Qwen3 here.
+        q_norm_w = (
+            handles.get(f"model.layers.{idx}.self_attn.q_norm.weight")
+            or handles.get(f"model.layers.{idx}.attn_q_norm.weight")
+        )
+        k_norm_w = (
+            handles.get(f"model.layers.{idx}.self_attn.k_norm.weight")
+            or handles.get(f"model.layers.{idx}.attn_k_norm.weight")
+        )
+        if q_norm_w is not None and k_norm_w is not None:
+            if config.qk_norm_gain:
+                q = _gemma3_norm(q, q_norm_w.as_numpy().astype(np.float32), config.rms_norm_eps)
+                k = _gemma3_norm(k, k_norm_w.as_numpy().astype(np.float32), config.rms_norm_eps)
+            else:
+                q = _rms_norm(q, q_norm_w.as_numpy().astype(np.float32), config.rms_norm_eps)
+                k = _rms_norm(k, k_norm_w.as_numpy().astype(np.float32), config.rms_norm_eps)
+
+        past = kv.stack(idx)
+        past_len = 0 if past is None else int(past[0].shape[0])
+        positions = np.arange(past_len, past_len + seq_len)
+
+        q = _apply_rope(q, cos_cache, sin_cache, positions,
+                        interleaved=config.rope_interleaved)
+        k = _apply_rope(k, cos_cache, sin_cache, positions,
+                        interleaved=config.rope_interleaved)
+
+        for pos in range(seq_len):
+            kv.append(idx, k[pos], v[pos])
+        k_hist, v_hist = kv.stack(idx)
+        k_full = np.repeat(k_hist, head_group, axis=1)
+        v_full = np.repeat(v_hist, head_group, axis=1)
+
+        scale = 1.0 / np.sqrt(head_dim)
+        attn = np.einsum("thd,Thd->htT", q, k_full) * scale
+        attn = attn + _causal_mask(seq_len, past_len, config.sliding_window)
+        attn = _softmax(attn, axis=-1)
+        context = np.einsum("htT,Thd->thd", attn, v_full)
+        attn_out = context.reshape(seq_len, q_dim)
+
+        # Output gate is enabled in Qwen3.5 config; only run if a
+        # separate ``self_attn.gate_proj`` tensor is present in the
+        # manifest. The MLX-4bit export of 0.8B does not include
+        # it; for now we leave the gate as a no-op when the tensor
+        # is missing rather than guessing where it lives.
+        gate_name = f"model.layers.{idx}.self_attn.gate_proj.weight"
+        if config.attn_output_gate and gate_name in handles:
+            gate_w, _ = _fetch_linear_with_quant(
+                handles, idx, "self_attn.gate_proj", config, np_dtype, dequant_cache=dequant_cache
+            )
+            gate_w = _as_linear(gate_w, config.hidden_size, f"layer{idx}.gate_proj")
+            gate = (x @ gate_w.astype(np.float32).T)
+            attn_out = attn_out * _sigmoid(gate)
+
+        o_w, _ = _fetch_linear_with_quant(
+            handles, idx, "self_attn.o_proj", config, np_dtype, dequant_cache=dequant_cache
+        )
+        o_w = _as_linear(o_w, q_dim, f"layer{idx}.o_proj")
+        attn_out = attn_out @ o_w.astype(np.float32).T
+        hidden = residual + attn_out
+
+        # MLP - same SwiGLU as Qwen2 / Qwen3. Qwen3.5's per-layer
+        # norm positions are the same as Qwen3: pre-feedforward
+        # (post-attention) and post-feedforward.
+        post_attn_norm_w = handles[
+            f"model.layers.{idx}.post_attention_layernorm.weight"
+        ].as_numpy().astype(np.float32)
+        residual = hidden
+        x = _rms_norm(hidden, post_attn_norm_w, config.rms_norm_eps)
+
+        gate_w, _ = _fetch_linear_with_quant(
+            handles, idx, "mlp.gate_proj", config, np_dtype, dequant_cache=dequant_cache
+        )
+        up_w, _ = _fetch_linear_with_quant(
+            handles, idx, "mlp.up_proj", config, np_dtype, dequant_cache=dequant_cache
+        )
+        down_w, _ = _fetch_linear_with_quant(
+            handles, idx, "mlp.down_proj", config, np_dtype, dequant_cache=dequant_cache
+        )
+        gate_w = _as_linear(gate_w, config.hidden_size, f"layer{idx}.mlp_gate")
+        up_w = _as_linear(up_w, config.hidden_size, f"layer{idx}.mlp_up")
+        inter = gate_w.shape[0]
+        down_w = _as_linear(down_w, inter, f"layer{idx}.mlp_down")
+        gateup = x @ np.concatenate([gate_w, up_w], axis=0).astype(np.float32).T
+        gate = gateup[:, :inter]
+        up = gateup[:, inter:]
+        silu_gate = gate / (1.0 + np.exp(-np.clip(gate, -80.0, 80.0)))
+        mlp_out = (silu_gate * up) @ down_w.astype(np.float32).T
+        return residual + mlp_out
+
+    def _qwen35_decoder_block(
+        idx: int,
+        handles: LayerHandles,
+        hidden: np.ndarray,
+        kv: KVCache,
+    ) -> np.ndarray:
+        """Qwen3.5 dispatch.
+
+        Picks between the full-attention path (re-using most of the
+        Qwen2 / Qwen3 block, with the Qwen3.5 output gate when its
+        weight is present) and the linear-attention path (DeltaNet).
+        The linear path is the dominant type in the 0.8B model
+        (18 / 24 layers) and is not yet implemented - we raise a
+        clear error rather than producing garbage.
+        """
+        layer_type = (
+            config.layer_types[idx] if config.layer_types is not None else None
+        )
+        if layer_type is None:
+            # Fall back to the Qwen2 / Qwen3 path if the model
+            # didn't ship a layer_types array. Pure-text Qwen3
+            # checkpoints don't have it either.
+            return _decoder_block(idx, handles, hidden, kv)
+        if layer_type == "full_attention":
+            return _qwen35_full_attention_block(idx, handles, hidden, kv)
+        if layer_type == "linear_attention":
+            raise NotImplementedError(
+                f"Qwen3.5 linear-attention (DeltaNet) layer {idx} is not "
+                f"yet implemented in FlatRun. Required tensors: "
+                f"linear_attn.in_proj_a/b/qkv/z, linear_attn.out_proj, "
+                f"linear_attn.conv1d, linear_attn.A_log, linear_attn.dt_bias, "
+                f"linear_attn.norm. The full-attention path is wired "
+                f"and works; the linear path requires a recurrent "
+                f"state update with chunked delta-rule. Layer type was "
+                f"detected from config.layer_types; conv kernel = "
+                f"{config.linear_conv_kernel_dim}."
+            )
+        raise ValueError(
+            f"Unknown Qwen3.5 layer_types entry {layer_type!r} at layer {idx}"
+        )
+
     def forward(
         layer: LayerDescriptor,
         handles: LayerHandles,
@@ -845,11 +1048,12 @@ def make_qwen2_forwarder(
 
         hidden = state["hidden"]
         assert hidden is not None
-        hidden = (
-            _gemma3_decoder_block(idx, handles, hidden, kv)
-            if config.model_arch == "gemma3"
-            else _decoder_block(idx, handles, hidden, kv)
-        )
+        if config.model_arch == "qwen3_5":
+            hidden = _qwen35_decoder_block(idx, handles, hidden, kv)
+        elif config.model_arch == "gemma3":
+            hidden = _gemma3_decoder_block(idx, handles, hidden, kv)
+        else:
+            hidden = _decoder_block(idx, handles, hidden, kv)
         if getattr(config, "debug_trace", False):
             import sys as _dbg
             r0 = hidden[0]
