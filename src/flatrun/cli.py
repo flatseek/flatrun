@@ -176,15 +176,16 @@ class LiveCursor:
 
     def __enter__(self) -> "LiveCursor":
         self._stop = False
-        # Reserve a dedicated stderr line BELOW the streamed stdout
-        # content. Two newlines moves the stderr cursor 2 lines past
-        # its current position so the cursor's per-tick ``\r`` cannot
-        # accidentally land on the streamed-content line (which was
-        # the bug that produced ``⠏ssistant:``). The first ``\n``
-        # moves stderr to a fresh line; the second adds a blank
-        # separator; the cursor then pulses on the line after that.
+        # Use ANSI absolute positioning to put the cursor on a fixed
+        # row at the bottom of the screen (``\033[999;1H`` moves to
+        # row 999, column 1 - any reasonable terminal has fewer
+        # than 999 lines so this is "off the bottom of the visible
+        # content"). This decouples the cursor from stdout's
+        # streaming cursor, which is the bug that produced
+        # ``⠏ssistant:`` when both streams happened to share the
+        # same TTY line.
         try:
-            self._stream.write("\n\n")
+            self._stream.write("\033[999;1H")
             self._stream.flush()
         except Exception:
             pass
@@ -196,11 +197,12 @@ class LiveCursor:
         self._stop = True
         if self._thread is not None:
             self._thread.join(timeout=_LIVE_CURSOR_INTERVAL * 3)
-        # Clear the cursor cell, then ``\n`` so the next line on
-        # stderr becomes the new current line. After this, ``cmd_chat``
-        # prints the thinking block on the next stdout write.
+        # Clear the cursor row (``\033[K`` = clear from cursor to end
+        # of line) and rewind to the bottom of the screen so the
+        # next stderr write - the ``\n`` in ``cmd_chat`` after the
+        # streamed content - lands on a fresh line below everything.
         try:
-            self._stream.write("\r" + " " * 4 + "\n")
+            self._stream.write("\033[999;1H\033[K")
             self._stream.flush()
         except Exception:
             pass
@@ -210,13 +212,14 @@ class LiveCursor:
         while not self._stop:
             frame = _LIVE_CURSOR_FRAMES[i % len(_LIVE_CURSOR_FRAMES)]
             try:
-                # Yellow cursor at column 0 of its own stderr line.
-                # ``\r`` rewinds to the start of the cursor line (which
-                # is separated from the streamed stdout line by the
-                # blank line reserved in ``__enter__``). Each frame
-                # overwrites only the first cell, so the cursor
-                # visually pulses in place.
-                self._stream.write(f"\r{_C_YELLOW}{frame}{_C_END}")
+                # Yellow cursor at column 0 of the reserved bottom
+                # row. The leading ``\033[999;1H`` re-asserts the
+                # absolute position each tick so a stray ``\n`` from
+                # the streamed-content path can't push the cursor
+                # away from the reserved row.
+                self._stream.write(
+                    f"\033[999;1H{_C_YELLOW}{frame}{_C_END}"
+                )
                 self._stream.flush()
             except Exception:
                 return
@@ -1029,13 +1032,15 @@ def cmd_chat(args) -> int:
         bundle["executor"].kv_cache.reset()
         turn += 1
         t0 = time.perf_counter()
-        # Print "Assistant: " once in green, then stream tokens onto
-        # the same line. ``LiveCursor`` pulses a braille cursor to
-        # ``stderr`` while the forwarder is working so the user can
-        # see the model is still thinking. ``--no-sample`` and
-        # ``--temperature`` etc. are honoured by ``_make_sampler``
-        # inside ``_generate_continuation``.
-        sys.stdout.write(f"{_C_ASSISTANT}Assistant: {_C_ASSISTANT_END}")
+        # Print "Assistant: " in green, then a newline. The newline
+        # is critical: without it stdout's cursor stays on the
+        # "Assistant: " line, and the LiveCursor's stderr output
+        # (which uses ``\r``) would end up on the same physical
+        # line as the streamed content - that's the bug that
+        # produced ``⠏ssistant:``. Moving stdout to a fresh line
+        # first means the cursor on stderr's own line stays
+        # visually separated from the streamed transcript below.
+        sys.stdout.write(f"{_C_ASSISTANT}Assistant:{_C_ASSISTANT_END}\n")
         sys.stdout.flush()
         with LiveCursor():
             generated, _, _ = _generate_continuation(
