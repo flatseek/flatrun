@@ -44,7 +44,7 @@ where to start.
 | Model | Why |
 |---|---|
 | Qwen3.5 / Qwen3.5-MoE | hybrid linear + full attention (DeltaNet), per-layer type selection, `attn_output_gate` |
-| Gemma 3 1B MLX-4bit | ⚠️ partial | Architecture decoded; **logits still flat** (see note) |
+| Gemma 3 1B MLX-4bit | ⚠️ partial | Architecture decoded (RMSNorm, qk-norm, sliding window, soft-cap all wired); **logits still flat** — root cause still under investigation, see "Known limitations" below |
 | Phi-3 | fused QKV / gate_up matmul, different RoPE scale |
 | Gemma 2 | different norm placement, logit soft-capping |
 | Mistral | sliding-window attention not implemented |
@@ -53,3 +53,21 @@ Adding a new architecture means (a) extending
 `flatrun.model.qwen2._decoder_block` with the new op, (b) the
 chat-template fallback in `flatrun.tokenizer.bpe`, and (c) a
 couple of unit tests built around a tiny synthetic model.
+
+## Known limitations
+
+Some larger models (~7B+) currently produce unstable activations or
+incorrect logits when run through FlatRun. The root cause is still
+under investigation - it is not yet known whether the cause is
+forwarder precision, a missing operation, or a subtle interaction
+with the pure-NumPy implementation. Models up to approximately 1B
+(Qwen2.5-0.5B, Qwen2.5-Coder-0.5B, Qwen3-0.6B, SmolLM2-360M,
+Gemma 3 1B structurally, Bonsai 1.7B Q1_0) have been validated
+against reference runtimes (LM Studio, llama.cpp).
+
+For diagnosis, use `--debug` to print per-layer mean / std / L2
+norm / position cosine / adjacent-row diff / NaN-Inf count, or
+`--memory-trace` to print RSS / Python-heap / dequant-cache / KV
+sizes per layer. The first layer where these drift from the
+reference run is where the forwarder diverges - please file an
+issue with that layer number, the model hash, and the prompt.

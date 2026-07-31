@@ -564,6 +564,106 @@ def make_qwen2_forwarder(
 
     state: dict[str, np.ndarray | None] = {"hidden": None, "embed": None}
 
+    # Saved between decoder blocks so the per-layer trace can report
+    # ``cos_to_prev`` (cosine similarity between this layer's output and
+    # the previous layer's). Used by ``_print_debug_stats``.
+    _prev_hidden: np.ndarray | None = None
+
+    def _print_debug_stats(
+        layer_idx: int,
+        h: np.ndarray,
+        prev_h: "np.ndarray | None",
+        arch: str,
+    ) -> None:
+        """One line of per-layer diagnostics to stderr.
+
+        Designed to pinpoint the first layer where FlatRun's hidden
+        state diverges from a reference runtime (LM Studio, llama.cpp,
+        HF transformers). For every decoder block output we print:
+
+          - ``mean`` / ``std`` - per-element mean and std of the
+            whole tensor. NaN/Inf-flagged if any element is non-finite.
+          - ``L2`` - per-row L2 norm. For well-normalised models this
+            is bounded by ``sqrt(hidden_size)``; blowing past that
+            means the residual stream is no longer unit-variance.
+          - ``row_cos(r0,rN)`` - cosine similarity between the first
+            and last position. Below ~0.5 across two layers means the
+            attention has stopped mixing positional information.
+          - ``adj_max`` - max absolute element difference between
+            adjacent rows. Useful for spotting where position
+            information is collapsing locally.
+          - ``cos_to_prev`` - cosine similarity of this layer's
+            output to the previous layer's. Should be >0.9 for
+            well-conditioned forwarders; drops below ~0.5 mean the
+            layer is essentially producing noise.
+          - ``nan/inf`` - count of non-finite values; non-zero means
+            the forward pass is no longer safe to use.
+        """
+        import sys as _dbg
+        finite = np.isfinite(h).all()
+        nan_inf_count = int((~np.isfinite(h)).sum())
+        mean = float(h.mean()) if finite else float("nan")
+        std = float(h.std()) if finite else float("nan")
+        l2_per_row = np.linalg.norm(h, axis=-1)
+        l2 = float(l2_per_row.mean())
+        if h.shape[0] > 1:
+            r0, rN = h[0], h[-1]
+            row_cos = float(r0 @ rN) / (
+                float(np.linalg.norm(r0)) * float(np.linalg.norm(rN)) + 1e-9
+            )
+            adj_max = float(np.abs(h[:-1] - h[1:]).max())
+        else:
+            row_cos = 1.0
+            adj_max = 0.0
+        if prev_h is not None and prev_h.shape == h.shape:
+            cos_to_prev = float(h.flatten() @ prev_h.flatten()) / (
+                float(np.linalg.norm(h)) * float(np.linalg.norm(prev_h)) + 1e-9
+            )
+        else:
+            cos_to_prev = 1.0
+        _dbg.stderr.write(
+            f"[dbg L{layer_idx:2d} arch={arch}] "
+            f"shape={tuple(h.shape)} "
+            f"mean={mean:+.3e} std={std:.3e} L2={l2:.1f} "
+            f"row_cos={row_cos:+.3f} adj_max={adj_max:.3e} "
+            f"cos_to_prev={cos_to_prev:+.3f} "
+            f"nan/inf={nan_inf_count} rss={_rss_mib():.0f}MiB\n"
+        )
+        _dbg.stderr.flush()
+
+    def _rss_mib() -> float:
+        """Return current process RSS in MiB.
+
+        Tries ``psutil`` first, then ``/proc/self/status`` on Linux,
+        then ``resource.getrusage(...).ru_maxrss`` as a last resort
+        (peak RSS, not current, so it's a floor on macOS). The
+        memory-trace uses the same probe so a missing psutil doesn't
+        silently print 0 MiB.
+        """
+        try:
+            import psutil
+            return float(psutil.Process().memory_info().rss) / 1024.0 / 1024.0
+        except Exception:
+            pass
+        try:
+            with open("/proc/self/status", "rb") as _f:
+                for _line in _f:
+                    if _line.startswith(b"VmRSS:"):
+                        return float(_line.split()[1]) / 1024.0
+        except Exception:
+            pass
+        try:
+            import resource as _res
+            _rss = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss
+            # ru_maxrss is peak. macOS units = bytes, Linux = KiB.
+            # Anything > 10 MiB worth of bytes is almost certainly
+            # already at GiB scale; treat the larger side as bytes.
+            if _rss > 100 * 1024 * 1024:
+                return float(_rss) / 1024.0 / 1024.0
+            return float(_rss) / 1024.0
+        except Exception:
+            return 0.0
+
     def _approx_python_heap_mib() -> float:
         """Sum the bytes of all reachable ``ndarray`` instances.
 
@@ -1191,45 +1291,10 @@ def make_qwen2_forwarder(
             hidden = _decoder_block(idx, handles, hidden, kv)
         if memory_trace:
             _print_memory_trace(idx, dequant_cache, kv, hidden)
+        nonlocal _prev_hidden
         if getattr(config, "debug_trace", False):
-            import sys as _dbg
-            r0 = hidden[0]
-            n0 = float(np.linalg.norm(r0))
-            rss_mib = 0.0
-            try:
-                import psutil
-                rss_mib = psutil.Process().memory_info().rss / 1024.0 / 1024.0
-            except Exception:
-                try:
-                    with open("/proc/self/status", "rb") as _f:
-                        for _line in _f:
-                            if _line.startswith(b"VmRSS:"):
-                                rss_mib = float(_line.split()[1]) / 1024.0
-                                break
-                except Exception:
-                    pass
-            if hidden.shape[0] > 1:
-                rN = hidden[-1]
-                d = float(np.abs(r0 - rN).max())
-                nN = float(np.linalg.norm(rN))
-                cos = float(r0 @ rN) / (n0 * nN + 1e-9)
-                d_mean = float(np.abs(hidden[:-1] - hidden[1:]).mean())
-                d_max = float(np.abs(hidden[:-1] - hidden[1:]).max())
-                _dbg.stderr.write(
-                    f"[dbg L{idx:2d} arch={config.model_arch}] "
-                    f"seq={hidden.shape[0]} hidden={hidden.shape[1]} "
-                    f"|n|={n0:.2f}..{nN:.2f} "
-                    f"|r0-rN|={d:.4f} cos={cos:.4f} "
-                    f"adj_diff mean={d_mean:.4f} max={d_max:.4f} "
-                    f"rss={rss_mib:.0f}MiB\n"
-                )
-            else:
-                _dbg.stderr.write(
-                    f"[dbg L{idx:2d} arch={config.model_arch}] "
-                    f"seq={hidden.shape[0]} hidden={hidden.shape[1]} "
-                    f"|n|={n0:.2f} rss={rss_mib:.0f}MiB\n"
-                )
-            _dbg.stderr.flush()
+            _print_debug_stats(idx, hidden, _prev_hidden, config.model_arch)
+        _prev_hidden = hidden
         state["hidden"] = hidden
 
         if idx != last_index:
