@@ -466,6 +466,13 @@ def _build_argparser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser
         action="store_true",
         help="Print per-step timing breakdown for the first N generation steps.",
     )
+    shared.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print per-layer hidden-state norms and position-collapse "
+             "metrics to stderr. Useful for cross-checking a model's "
+             "forwarder against a reference (LM Studio, llama.cpp).",
+    )
 
     parser = argparse.ArgumentParser(
         prog="flatrun",
@@ -635,12 +642,14 @@ def _load_model_bundle(args, parser: argparse.ArgumentParser) -> dict:
         raw_cfg = _build_config_from_gguf(gguf_path)
         qcfg = Qwen2Config.from_hf_config(raw_cfg)
         qcfg.quant_gguf = args.quant or "Q8_0"
+        qcfg.debug_trace = args.debug
     else:
         if loaded.config is None or loaded.config.raw is None:
             parser.exit(1, "No config.json found next to model weights.\n")
         qcfg = Qwen2Config.from_hf_config(loaded.config.raw)
         qcfg.quant_mlx_4bit = fmt == "mlx"
         qcfg.quant_gguf = None
+        qcfg.debug_trace = args.debug
     forwarder = make_qwen2_forwarder(qcfg)
 
     scheduler = loaded.runtime.build_scheduler(
@@ -968,6 +977,7 @@ def cmd_chat(args) -> int:
         raw_cfg = _build_config_from_gguf(gguf_path)
         qcfg = Qwen2Config.from_hf_config(raw_cfg)
         qcfg.quant_gguf = args.quant or "Q8_0"
+        qcfg.debug_trace = args.debug
     else:
         if loaded.config is None or loaded.config.raw is None:
             print("No config.json found next to model weights.", file=sys.stderr)
@@ -975,6 +985,7 @@ def cmd_chat(args) -> int:
         qcfg = Qwen2Config.from_hf_config(loaded.config.raw)
         qcfg.quant_mlx_4bit = fmt == "mlx"
         qcfg.quant_gguf = None
+        qcfg.debug_trace = args.debug
     forwarder = make_qwen2_forwarder(qcfg)
 
     # 4. Stream one prompt + max_new tokens.

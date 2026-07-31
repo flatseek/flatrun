@@ -69,6 +69,11 @@ class Qwen2Config:
     rope_theta: float = 1000000.0
     rms_norm_eps: float = 1e-6
     tie_word_embeddings: bool = False
+    # When True, ``make_qwen2_forwarder`` writes per-layer hidden
+    # state diagnostics to stderr (norm, position diff, position
+    # cosine similarity). Set via the CLI's ``--debug`` flag. Off by
+    # default - the trace adds noticeable per-step overhead.
+    debug_trace: bool = False
     # Architecture tag. Drives which decoder block the forwarder
     # builds and which Q/K-norm formula it applies. Supported:
     # ``"qwen2"`` (Llama/Qwen2/Qwen2.5/Qwen3), ``"gemma3"``.
@@ -808,6 +813,30 @@ def make_qwen2_forwarder(
             if config.model_arch == "gemma3"
             else _decoder_block(idx, handles, hidden, kv)
         )
+        if getattr(config, "debug_trace", False):
+            import sys as _dbg
+            r0 = hidden[0]
+            n0 = float(np.linalg.norm(r0))
+            if hidden.shape[0] > 1:
+                rN = hidden[-1]
+                d = float(np.abs(r0 - rN).max())
+                nN = float(np.linalg.norm(rN))
+                cos = float(r0 @ rN) / (n0 * nN + 1e-9)
+                d_mean = float(np.abs(hidden[:-1] - hidden[1:]).mean())
+                d_max = float(np.abs(hidden[:-1] - hidden[1:]).max())
+                _dbg.stderr.write(
+                    f"[dbg L{idx:2d} arch={config.model_arch}] "
+                    f"seq={hidden.shape[0]} hidden={hidden.shape[1]} "
+                    f"|n|={n0:.2f}..{nN:.2f} "
+                    f"|r0-rN|={d:.4f} cos={cos:.4f} "
+                    f"adj_diff mean={d_mean:.4f} max={d_max:.4f}\n"
+                )
+            else:
+                _dbg.stderr.write(
+                    f"[dbg L{idx:2d} arch={config.model_arch}] "
+                    f"seq={hidden.shape[0]} hidden={hidden.shape[1]} |n|={n0:.2f}\n"
+                )
+            _dbg.stderr.flush()
         state["hidden"] = hidden
 
         if idx != last_index:
