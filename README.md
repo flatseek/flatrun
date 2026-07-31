@@ -164,28 +164,60 @@ The executor runs the full forward pass: embed → 28 decoder blocks
 → final RMSNorm → LM head, with the KV cache growing incrementally
 as ``tokens`` are appended.
 
+### Interactive chat
+
+```bash
+PYTHONPATH=src python3 -m flatrun.cli chat \
+    --model ~/.lmstudio/models/HuggingFaceTB/SmolLM2-360M-Instruct-GGUF/smollm2-360m-instruct-q8_0.gguf \
+    --max-new 48 --temperature 0.5
+
+You: Tell me a haiku about the sea.
+Assistant: Silent waves, they sleep,
+  Their hearts in stillness lie.
+  The ocean's vast and deep,
+  ...
+You: exit
+Bye.
+```
+
+Each turn is rendered through the model's chat template with the
+full prior history included. Replies stop on the natural end-of-turn
+marker (``<|im_end|>`` for Qwen, ``<|endoftext|>`` for GPT-style,
+``</s>`` for LLaMA) or after ``--max-new`` tokens, whichever comes
+first. Use ``--no-history`` to make every turn a one-shot call with
+no prior context.
+
 ---
 
 ## CLI reference
 
-```text
-python -m flatrun.cli --model <path> [options]
+The CLI exposes two subcommands:
 
+```text
+flatrun run   [shared-options] [--prompt TEXT | --messages-json JSON]
+flatrun chat  [shared-options] [--no-history]
+flatrun --help            # lists shared options + subcommands
+flatrun run --help        # full help for the one-shot mode
+flatrun chat --help       # full help for the REPL mode
+```
+
+Shared options (identical for ``run`` and ``chat``):
+
+```text
 Model input:
   --model PATH             path to a GGUF file, a SafeTensors directory,
                            or an MLX-4bit directory
   --tokenizer PATH         override the tokenizer directory
-  --prompt TEXT            raw text prompt (skipped if --messages-json is set)
-  --system TEXT            prepend a system turn
-  --messages-json JSON     render a multi-turn chat via the chat template
-  --no-chat-template       treat --prompt as raw text, skip template
+  --system TEXT            prepend a system turn in chat templates
+  --no-chat-template       treat prompts as raw text, skip template
 
 Runtime:
   --cache-mb N             memory cache cap in MiB (default 256)
   --quant NAME             override GGUF quant type
 
 Generation:
-  --max-new N              tokens to generate (default 1)
+  --max-new N              tokens to generate after the prompt
+                           (run: default 1, chat: default 128)
   --temperature F          sampling temperature (default 0.11)
   --sample-top-k N         top-k filter at sample time (default 20)
   --sample-top-p F         nucleus filter (default 0.59)
@@ -198,6 +230,12 @@ Generation:
 Diagnostics:
   --profile                print per-step timing breakdown
 ```
+
+`run`-only options: ``--prompt TEXT``, ``--messages-json JSON``.
+`chat`-only options: ``--no-history``.
+
+For backwards compatibility, calling ``flatrun --model ... --prompt ...``
+without an explicit subcommand is treated as ``flatrun run``.
 
 ---
 
