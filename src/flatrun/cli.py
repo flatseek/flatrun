@@ -749,7 +749,7 @@ def cmd_run(args) -> int:
     if generated:
         thinking, answer = _split_thinking(raw_text)
         if thinking:
-            print(f"\nThinking:\n{thinking}")
+            print(f"\n\033[2mThinking:\n{thinking}\n\033[0m")
         print(f"\nGenerated text: {answer!r}")
     if args.profile and len(step_times) > 1:
         first = step_times[0]
@@ -843,7 +843,7 @@ def cmd_chat(args) -> int:
                 reply_text = reply_text.split(stop, 1)[0]
                 break
         if thinking:
-            print(f"  (thinking: {len(thinking)} chars)")
+            print(f"\033[2mThinking:\n{thinking}\n\033[0m")
         print(f"Assistant: {reply_text}")
         print(f"  ({len(generated)} tokens, {dt:.1f}s, {len(generated) / max(dt, 1e-3):.1f} tok/s)\n")
         messages.append({"role": "assistant", "content": reply_text})

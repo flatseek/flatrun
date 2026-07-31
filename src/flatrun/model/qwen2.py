@@ -69,6 +69,28 @@ class Qwen2Config:
     rope_theta: float = 1000000.0
     rms_norm_eps: float = 1e-6
     tie_word_embeddings: bool = False
+    # Architecture tag. Drives which decoder block the forwarder
+    # builds and which Q/K-norm formula it applies. Supported:
+    # ``"qwen2"`` (Llama/Qwen2/Qwen2.5/Qwen3), ``"gemma3"``.
+    model_arch: str = "qwen2"
+    # Pre-attention scale for the attention score. Gemma 3 sometimes
+    # exposes this as ``query_pre_attn_scalar`` separate from
+    # ``head_dim``; when ``None`` we fall back to ``head_dim``.
+    query_pre_attn_scalar: int | None = None
+    # When True, per-head Q/K RMSNorm uses ``1 + weight`` as the gain
+    # (Gemma 3 convention). When False, plain ``weight`` (Qwen3 / Llama).
+    qk_norm_gain: bool = False
+    # When True, apply ``post_feedforward_layernorm`` after the MLP
+    # residual at the end of each decoder block (Gemma 3).
+    mlp_norm_after_block: bool = False
+    # Sliding-window attention size. When non-None, each position
+    # only attends to the most recent ``sliding_window`` positions
+    # (inclusive). Gemma 3 ships with sliding_window=512 on the
+    # 1B variant; the larger sizes alternate sliding with full
+    # attention per layer, which the current forwarder doesn't
+    # model. Setting it on every layer still produces correct
+    # outputs on the 1B family.
+    sliding_window: int | None = None
     # RoPE pair layout. False = HuggingFace ``rotate_half`` (ggml calls
     # it NEOX); True = consecutive pairs (ggml NORM). HF-layout
     # checkpoints are always False. GGUF files depend on architecture:
@@ -82,7 +104,28 @@ class Qwen2Config:
 
     @classmethod
     def from_hf_config(cls, raw: dict[str, object]) -> "Qwen2Config":
-        """Build a config from a parsed ``config.json``."""
+        """Build a config from a parsed ``config.json``.
+
+        Architecture detection looks at ``architectures`` and
+        ``model_type``. Anything that isn't explicitly Gemma gets the
+        Qwen2 / Llama path - that's the broader family Qwen2.5,
+        Qwen3, Llama 1-3 and SmolLM2 all live in.
+        """
+        architectures = raw.get("architectures") or ()
+        model_type = str(raw.get("model_type") or "")
+        arch = "gemma3" if (
+            (architectures and any("Gemma3" in str(a) for a in architectures))
+            or "gemma3" in model_type
+        ) else "qwen2"
+
+        tie = raw.get("tie_word_embeddings")
+        if tie is None:
+            # Most Gemma 3 sizes ship with tied embeddings; Llama /
+            # Qwen default to untied. The HuggingFace convention is
+            # that a missing key is *not* a hard "false" - it just
+            # means "trust the architecture defaults".
+            tie = arch != "gemma3"
+
         return cls(
             vocab_size=int(raw.get("vocab_size", 152064)),
             hidden_size=int(raw.get("hidden_size", 3584)),
@@ -94,11 +137,19 @@ class Qwen2Config:
             max_position_embeddings=int(raw.get("max_position_embeddings", 32768)),
             rope_theta=float(raw.get("rope_theta", 1000000.0)),
             rms_norm_eps=float(raw.get("rms_norm_eps", 1e-6)),
-            tie_word_embeddings=bool(raw.get("tie_word_embeddings", False)),
+            tie_word_embeddings=bool(tie),
             # HF checkpoints are always stored in rotate_half layout.
             # ``rope_interleaved`` in an HF config.json refers to the
             # same distinction, so honour it when present.
             rope_interleaved=bool(raw.get("rope_interleaved", False)),
+            model_arch=arch,
+            # Gemma 3 sometimes uses ``query_pre_attn_scalar`` as a
+            # separate value from ``head_dim`` for the attention
+            # score scale. When absent, ``head_dim`` is the fallback.
+            query_pre_attn_scalar=_safe_int(raw.get("query_pre_attn_scalar")),
+            qk_norm_gain=arch == "gemma3",
+            mlp_norm_after_block=arch == "gemma3",
+            sliding_window=_safe_int(raw.get("sliding_window")),
         )
 
 
@@ -120,6 +171,23 @@ def _rms_norm(x: np.ndarray, weight: np.ndarray, eps: float) -> np.ndarray:
     var = np.mean(x32 * x32, axis=-1, keepdims=True)
     inv = 1.0 / np.sqrt(var + eps)
     return x32 * inv * weight.astype(np.float32, copy=False)
+
+
+def _gemma3_norm(x: np.ndarray, weight: np.ndarray, eps: float) -> np.ndarray:
+    """Gemma 3 RMSNorm variant.
+
+    Same normalisation as :func:`_rms_norm` but the gain is
+    ``1 + weight`` rather than ``weight``. The HF initialisation sets
+    ``weight`` to zero, so the two formulations are equivalent at
+    initialisation; the saved checkpoint has trained the gain away
+    from zero and switching them quietly doubles or halves the
+    Q/K activation magnitude, which is enough to flatten the
+    attention map and turn the model into a punctuation sampler.
+    """
+    x32 = x.astype(np.float32, copy=False)
+    var = np.mean(x32 * x32, axis=-1, keepdims=True)
+    inv = 1.0 / np.sqrt(var + eps)
+    return x32 * inv * (1.0 + weight.astype(np.float32, copy=False))
 
 
 def _precompute_rope(
@@ -203,7 +271,7 @@ def _apply_rope(
     )
 
 
-def _causal_mask(seq_len: int, past_len: int) -> np.ndarray:
+def _causal_mask(seq_len: int, past_len: int, sliding_window: int | None = None) -> np.ndarray:
     """Additive attention mask of shape ``(seq_len, past_len + seq_len)``.
 
     Query row ``t`` may attend to key column ``j`` only when
@@ -211,12 +279,22 @@ def _causal_mask(seq_len: int, past_len: int) -> np.ndarray:
     whole future of the prompt, which quietly corrupts the hidden
     states that later positions then attend to - the single largest
     source of fluent-looking nonsense in a hand-written decoder.
+
+    ``sliding_window`` further restricts each row to the most recent
+    ``sliding_window`` keys. Gemma 3 ships with ``sliding_window=512``;
+    the 1B variant applies it to every layer, so missing it produces
+    a flat, placeholder-laden distribution rather than the
+    logit-diverse output of a correctly-windowed model.
     """
     total = past_len + seq_len
     q_pos = np.arange(seq_len, dtype=np.int32)[:, None] + past_len
     k_pos = np.arange(total, dtype=np.int32)[None, :]
     mask = np.zeros((seq_len, total), dtype=np.float32)
     mask[k_pos > q_pos] = -np.inf
+    if sliding_window is not None and sliding_window > 0:
+        # Position ``t`` may only see keys in
+        # ``[t - sliding_window + 1, t]``.
+        mask[k_pos < q_pos - sliding_window + 1] = -np.inf
     return mask
 
 
@@ -554,6 +632,144 @@ def make_qwen2_forwarder(
 
         return residual + mlp_out
 
+    def _gemma3_decoder_block(
+        idx: int,
+        handles: LayerHandles,
+        hidden: np.ndarray,
+        kv: KVCache,
+    ) -> np.ndarray:
+        """One Gemma 3 decoder block.
+
+        Differs from the Qwen2 / Llama path in three ways:
+
+        * Every RMSNorm in the block - ``input_layernorm``,
+          ``pre_feedforward_layernorm``, ``post_feedforward_layernorm``,
+          and the per-head Q / K norms - uses the Gemma 3 convention
+          ``x * rsqrt(...) * (1 + weight)`` rather than the plain
+          ``x * rsqrt(...) * weight``. The weights are initialised to
+          zero, so the two formulations match at initialisation; a
+          trained checkpoint has shifted the gain away from zero, so
+          substituting plain RMSNorm quietly doubles or halves the
+          activation magnitude. See :func:`_gemma3_norm`.
+        * The attention score is scaled by
+          ``sqrt(query_pre_attn_scalar)`` rather than
+          ``sqrt(head_dim)``. Gemma 3 sometimes exposes these as the
+          same value but they don't have to be.
+        * The MLP block is bounded by *two* RMSNorms:
+          ``pre_feedforward_layernorm`` before the matmuls and
+          ``post_feedforward_layernorm`` after the MLP residual. The
+          older ``post_attention_layernorm`` is not referenced by the
+          decoder block in HF ``Gemma3TextDecoderLayer``.
+        """
+        seq_len = hidden.shape[0]
+        attn_scale = config.query_pre_attn_scalar or head_dim
+
+        # ----- Attention -----
+        attn_norm_w = handles[
+            f"model.layers.{idx}.input_layernorm.weight"
+        ].as_numpy().astype(np.float32)
+        residual = hidden
+        x = _gemma3_norm(hidden, attn_norm_w, config.rms_norm_eps)
+
+        q_w, _ = _fetch_linear_with_quant(
+            handles, idx, "self_attn.q_proj", config, np_dtype, dequant_cache=dequant_cache
+        )
+        k_w, _ = _fetch_linear_with_quant(
+            handles, idx, "self_attn.k_proj", config, np_dtype, dequant_cache=dequant_cache
+        )
+        v_w, _ = _fetch_linear_with_quant(
+            handles, idx, "self_attn.v_proj", config, np_dtype, dequant_cache=dequant_cache
+        )
+        q_w = _as_linear(q_w, config.hidden_size, f"layer{idx}.q_proj")
+        k_w = _as_linear(k_w, config.hidden_size, f"layer{idx}.k_proj")
+        v_w = _as_linear(v_w, config.hidden_size, f"layer{idx}.v_proj")
+        qkv_w = np.concatenate([q_w, k_w, v_w], axis=0).astype(np.float32)
+        qkv = x @ qkv_w.T
+
+        q = qkv[:, :q_dim].reshape(seq_len, n_heads, head_dim)
+        k = qkv[:, q_dim : q_dim + kv_dim].reshape(seq_len, n_kv_heads, head_dim)
+        v = qkv[:, q_dim + kv_dim :].reshape(seq_len, n_kv_heads, head_dim)
+
+        past = kv.stack(idx)
+        past_len = 0 if past is None else int(past[0].shape[0])
+        positions = np.arange(past_len, past_len + seq_len)
+
+        # Q / K RMSNorm with Gemma's ``1 + weight`` gain. The norm
+        # is applied to each (seq, head, head_dim) slice, *before*
+        # RoPE - same placement as Qwen3.
+        q_norm_w = handles[
+            f"model.layers.{idx}.self_attn.q_norm.weight"
+        ].as_numpy().astype(np.float32)
+        k_norm_w = handles[
+            f"model.layers.{idx}.self_attn.k_norm.weight"
+        ].as_numpy().astype(np.float32)
+        q = _gemma3_norm(q, q_norm_w, config.rms_norm_eps)
+        k = _gemma3_norm(k, k_norm_w, config.rms_norm_eps)
+
+        q = _apply_rope(q, cos_cache, sin_cache, positions,
+                        interleaved=config.rope_interleaved)
+        k = _apply_rope(k, cos_cache, sin_cache, positions,
+                        interleaved=config.rope_interleaved)
+
+        for pos in range(seq_len):
+            kv.append(idx, k[pos], v[pos])
+        k_hist, v_hist = kv.stack(idx)
+
+        k_full = np.repeat(k_hist, head_group, axis=1)
+        v_full = np.repeat(v_hist, head_group, axis=1)
+
+        scale = 1.0 / np.sqrt(attn_scale)
+        attn = np.einsum("thd,Thd->htT", q, k_full) * scale
+        attn = attn + _causal_mask(seq_len, past_len, config.sliding_window)
+        attn = _softmax(attn, axis=-1)
+        context = np.einsum("htT,Thd->thd", attn, v_full)
+        attn_out = context.reshape(seq_len, q_dim)
+
+        o_w, _ = _fetch_linear_with_quant(
+            handles, idx, "self_attn.o_proj", config, np_dtype, dequant_cache=dequant_cache
+        )
+        o_w = _as_linear(o_w, q_dim, f"layer{idx}.o_proj")
+        attn_out = attn_out @ o_w.astype(np.float32).T
+        hidden = residual + attn_out
+
+        # ----- MLP (SwiGLU) with pre/post norms -----
+        pre_mlp_norm_w = handles[
+            f"model.layers.{idx}.pre_feedforward_layernorm.weight"
+        ].as_numpy().astype(np.float32)
+        residual = hidden
+        x = _gemma3_norm(hidden, pre_mlp_norm_w, config.rms_norm_eps)
+
+        gate_w, _ = _fetch_linear_with_quant(
+            handles, idx, "mlp.gate_proj", config, np_dtype, dequant_cache=dequant_cache
+        )
+        up_w, _ = _fetch_linear_with_quant(
+            handles, idx, "mlp.up_proj", config, np_dtype, dequant_cache=dequant_cache
+        )
+        down_w, _ = _fetch_linear_with_quant(
+            handles, idx, "mlp.down_proj", config, np_dtype, dequant_cache=dequant_cache
+        )
+        gate_w = _as_linear(gate_w, config.hidden_size, f"layer{idx}.gate_proj")
+        up_w = _as_linear(up_w, config.hidden_size, f"layer{idx}.up_proj")
+        inter = gate_w.shape[0]
+        down_w = _as_linear(down_w, inter, f"layer{idx}.down_proj")
+
+        gateup = x @ np.concatenate([gate_w, up_w], axis=0).astype(np.float32).T
+        gate = gateup[:, :inter]
+        up = gateup[:, inter:]
+        silu_gate = gate / (1.0 + np.exp(-np.clip(gate, -80.0, 80.0)))
+        mlp_out = (silu_gate * up) @ down_w.astype(np.float32).T
+        hidden = residual + mlp_out
+
+        # Gemma 3 applies ``post_feedforward_layernorm`` to the *whole*
+        # block's output (after the MLP residual) before handing it to
+        # the next layer. This is what differentiates Gemma's residual
+        # pattern from Qwen2 / Llama.
+        post_mlp_norm_w = handles[
+            f"model.layers.{idx}.post_feedforward_layernorm.weight"
+        ].as_numpy().astype(np.float32)
+        hidden = _gemma3_norm(hidden, post_mlp_norm_w, config.rms_norm_eps)
+        return hidden
+
     def forward(
         layer: LayerDescriptor,
         handles: LayerHandles,
@@ -573,7 +789,11 @@ def make_qwen2_forwarder(
 
         hidden = state["hidden"]
         assert hidden is not None
-        hidden = _decoder_block(idx, handles, hidden, kv)
+        hidden = (
+            _gemma3_decoder_block(idx, handles, hidden, kv)
+            if config.model_arch == "gemma3"
+            else _decoder_block(idx, handles, hidden, kv)
+        )
         state["hidden"] = hidden
 
         if idx != last_index:
@@ -581,7 +801,12 @@ def make_qwen2_forwarder(
 
         # ----- Final norm + LM head, after the last block has run -----
         norm_w = handles["model.norm.weight"].as_numpy().astype(np.float32)
-        hidden = _rms_norm(hidden, norm_w, config.rms_norm_eps)
+        # Gemma 3's ``model.norm`` is also a Gemma3RMSNorm
+        # (``1 + weight`` gain); every other arch uses plain RMSNorm.
+        if config.model_arch == "gemma3":
+            hidden = _gemma3_norm(hidden, norm_w, config.rms_norm_eps)
+        else:
+            hidden = _rms_norm(hidden, norm_w, config.rms_norm_eps)
         if config.tie_word_embeddings:
             head_w = state["embed"]
             assert head_w is not None
