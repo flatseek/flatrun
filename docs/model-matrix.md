@@ -25,7 +25,7 @@ and llama.cpp's Q8_1-quantised activations.
 | Qwen2.5-Coder-0.5B | `Qwen2.5-Coder-0.5B-Q8_0.gguf` | ✅ | NEOX RoPE |
 | SmolLM2-360M-Instruct | `smollm2-360m-instruct-q8_0.gguf` | ✅ | NORM RoPE |
 | Qwen3-0.6B | `Qwen3-0.6B-Q4_K_M.gguf` | ✅ | per-head q/k norm |
-| Bonsai-1.7B | `Bonsai-1.7B-Q1_0.gguf` | ⚠️ | 1-bit, 1.125 bpw |
+| Bonsai-1.7B | `Bonsai-1.7B-Q1_0.gguf` | ✅ | 1-bit, 1.125 bpw |
 
 ## Requantised (K-quants produced locally for decoder testing)
 
@@ -43,7 +43,7 @@ where to start.
 | Model | Why |
 |---|---|
 | Qwen3.5 / Qwen3.5-MoE | hybrid linear + full attention (DeltaNet), per-layer type selection, `attn_output_gate` |
-| Gemma 3 | per-MLP RMSNorm, gated attention, `query_pre_attn_scalar`, qk-norm gain `(1 + w)` |
+| Gemma 3 1B MLX-4bit | ⚠️ partial | Architecture decoded; **logits still flat** (see note) |
 | Phi-3 | fused QKV / gate_up matmul, different RoPE scale |
 | Gemma 2 | different norm placement, logit soft-capping |
 | Mistral | sliding-window attention not implemented |

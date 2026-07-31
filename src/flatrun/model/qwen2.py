@@ -91,6 +91,7 @@ class Qwen2Config:
     # model. Setting it on every layer still produces correct
     # outputs on the 1B family.
     sliding_window: int | None = None
+    attn_logit_softcap: float | None = None
     # RoPE pair layout. False = HuggingFace ``rotate_half`` (ggml calls
     # it NEOX); True = consecutive pairs (ggml NORM). HF-layout
     # checkpoints are always False. GGUF files depend on architecture:
@@ -150,6 +151,8 @@ class Qwen2Config:
             qk_norm_gain=arch == "gemma3",
             mlp_norm_after_block=arch == "gemma3",
             sliding_window=_safe_int(raw.get("sliding_window")),
+            attn_logit_softcap=_safe_int(raw.get("attn_logit_softcap"))
+            or (50.0 if arch == "gemma3" else None),
         )
 
 
@@ -588,6 +591,9 @@ def make_qwen2_forwarder(
         scale = 1.0 / np.sqrt(head_dim)
         attn = np.einsum("thd,Thd->htT", q, k_full) * scale
         attn = attn + _causal_mask(seq_len, past_len)
+        if config.attn_logit_softcap is not None:
+            cap = float(config.attn_logit_softcap)
+            attn = np.tanh(attn / cap) * cap
         attn = _softmax(attn, axis=-1)
         context = np.einsum("htT,Thd->thd", attn, v_full)
         attn_out = context.reshape(seq_len, q_dim)
@@ -721,6 +727,14 @@ def make_qwen2_forwarder(
         scale = 1.0 / np.sqrt(attn_scale)
         attn = np.einsum("thd,Thd->htT", q, k_full) * scale
         attn = attn + _causal_mask(seq_len, past_len, config.sliding_window)
+        # Gemma 2/3 default soft-cap (50.0) prevents the Q.K product
+        # from saturating the softmax once the trained RMSNorm gain
+        # pushes activations past ~30x at late layers. Without this
+        # every position attends to a single key and the residual
+        # stream collapses across positions, producing flat logits.
+        if config.attn_logit_softcap is not None:
+            cap = float(config.attn_logit_softcap)
+            attn = np.tanh(attn / cap) * cap
         attn = _softmax(attn, axis=-1)
         context = np.einsum("htT,Thd->thd", attn, v_full)
         attn_out = context.reshape(seq_len, q_dim)
