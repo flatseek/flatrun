@@ -94,14 +94,15 @@ _C_ASSISTANT_END = "\033[0m"
 _C_DIM = "\033[2m"          # dim
 _C_GREY = "\033[90m"        # bright-black - "grey" thinking body
 _C_ITALIC = "\033[3m"       # italic  - thinking body
+_C_YELLOW = "\033[33m"     # yellow  - live cursor
 _C_END = "\033[0m"
 
 # Braille-pattern frames for the live cursor that pulses at the
-# end of a streaming token run. ``\r`` rewinds the line and the
-# pattern advances each tick, so it reads as a spinning cursor
-# without flickering the rest of the line. The pulse cadence is
-# ~8 fps which matches what Claude Code does for its "thinking"
-# indicator.
+# LEFT of the line being streamed. The yellow frame replaces the
+# thinking marker, so the user sees a spinning yellow dot
+# followed by a dim 'Thinking:' label while the model is still
+# reasoning. The frame advances each tick; ``\r`` rewinds the
+# line so the rest of the streamed content is not overwritten.
 _LIVE_CURSOR_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _LIVE_CURSOR_INTERVAL = 0.12  # seconds
 
@@ -194,9 +195,11 @@ class LiveCursor:
         while not self._stop:
             frame = _LIVE_CURSOR_FRAMES[i % len(_LIVE_CURSOR_FRAMES)]
             try:
-                # Dim the cursor so it doesn't compete with the
-                # streamed text for visual attention.
-                self._stream.write(f"\r{_C_DIM}{frame}{_C_END}")
+                # Yellow cursor at the LEFT of the line. Using
+                # ``\r`` rewinds to column 0 each tick, so the
+                # streamed text on the same line is left intact
+                # after the cursor overwrites only the first cell.
+                self._stream.write(f"\r{_C_YELLOW}{frame}{_C_END}")
                 self._stream.flush()
             except Exception:
                 return
@@ -921,11 +924,12 @@ def cmd_run(args) -> int:
     if generated:
         thinking, answer = _split_thinking(raw_text)
         if thinking:
-            # Dim grey italic for the chain-of-thought. The block
-            # markers themselves are stripped by ``_split_thinking``;
-            # newlines are collapsed by ``_flatten_thinking`` so the
-            # trace fits on one line under the generated answer.
-            print(f"\n{_C_DIM}{_C_ITALIC}{_C_GREY}Thinking: {thinking}{_C_END}")
+            # Layout: ``\n`` then [dim] 'Thinking:' [end] [grey italic]
+            # <content> [end]. The dim colour frames just the label;
+            # the body is grey italic on the same line. ``_split_thinking``
+            # stripped the ``<think>``/``</think>`` markers and
+            # ``_flatten_thinking`` collapsed newlines.
+            print(f"\n{_C_DIM}Thinking:{_C_END} {_C_GREY}{_C_ITALIC}{thinking}{_C_END}")
         print(f"\nGenerated text: {answer!r}")
     if args.profile and len(step_times) > 1:
         first = step_times[0]
@@ -1030,10 +1034,11 @@ def cmd_chat(args) -> int:
                 reply_text = reply_text.split(stop, 1)[0]
                 break
         if thinking:
-            # Dim + grey + italic chain-of-thought on its own line.
-            # ``_split_thinking`` already stripped the markers and
-            # ``_flatten_thinking`` collapsed newlines.
-            print(f"\n{_C_DIM}{_C_ITALIC}{_C_GREY}Thinking: {thinking}{_C_END}")
+            # ``Thinking:`` in dim, body in grey italic. ``_split_thinking``
+            # stripped the markers and ``_flatten_thinking`` collapsed
+            # newlines. The live yellow cursor that pulsed during
+            # generation is on stderr, two lines up.
+            print(f"\n{_C_DIM}Thinking:{_C_END} {_C_GREY}{_C_ITALIC}{thinking}{_C_END}")
         # ``Assistant:`` in green; the streamed reply is already on
         # the line above so we just print it here for the REPL log.
         print(f"{_C_ASSISTANT}Assistant: {reply_text}{_C_ASSISTANT_END}")
