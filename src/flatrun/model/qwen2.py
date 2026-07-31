@@ -69,6 +69,23 @@ class Qwen2Config:
     rope_theta: float = 1000000.0
     rms_norm_eps: float = 1e-6
     tie_word_embeddings: bool = False
+    # Qwen3.5 hybrid attention: each layer is either ``"full_attention"``
+    # or ``"linear_attention"`` (DeltaNet). The forwarder uses
+    # ``layer_types[i]`` to pick the right decoder block. Linear layers
+    # are not yet implemented - the forwarder raises NotImplementedError
+    # rather than producing garbage.
+    layer_types: tuple[str, ...] | None = None
+    # Qwen3.5 full attention applies a sigmoid gate on its output:
+    # ``attn_out = attn_out * sigmoid(gate_proj(x))``. Set from
+    # ``attn_output_gate`` in the HF / Qwen3.5 config.
+    attn_output_gate: bool = False
+    # Qwen3.5 linear-attention specifics. ``linear_conv_kernel_dim``
+    # is the depthwise 1D conv kernel applied to Q/K/V before the
+    # recurrence. Currently informational - the linear path is stubbed.
+    linear_conv_kernel_dim: int = 0
+    linear_key_head_dim: int = 0
+    linear_num_key_heads: int = 0
+    linear_num_value_heads: int = 0
     # When True, ``make_qwen2_forwarder`` writes per-layer hidden
     # state diagnostics to stderr (norm, position diff, position
     # cosine similarity). Set via the CLI's ``--debug`` flag. Off by
@@ -119,9 +136,20 @@ class Qwen2Config:
         """
         architectures = raw.get("architectures") or ()
         model_type = str(raw.get("model_type") or "")
-        arch = "gemma3" if (
+        # Qwen3.5 ships as a VL model whose text decoder is nested
+        # under ``text_config``. Look at both layers so a multimodal
+        # checkpoint produces the same config object as a pure-text
+        # one.
+        text_config = raw.get("text_config") or {}
+        text_model_type = str(text_config.get("model_type") or model_type)
+        arch = "qwen3_5" if (
+            (architectures and any("Qwen3_5" in str(a) for a in architectures))
+            or "qwen3_5" in model_type
+            or "qwen3_5" in text_model_type
+        ) else "gemma3" if (
             (architectures and any("Gemma3" in str(a) for a in architectures))
             or "gemma3" in model_type
+            or "gemma3" in text_model_type
         ) else "qwen2"
 
         tie = raw.get("tie_word_embeddings")
@@ -133,31 +161,40 @@ class Qwen2Config:
             tie = arch != "gemma3"
 
         return cls(
-            vocab_size=int(raw.get("vocab_size", 152064)),
-            hidden_size=int(raw.get("hidden_size", 3584)),
-            intermediate_size=int(raw.get("intermediate_size", 18944)),
-            num_hidden_layers=int(raw.get("num_hidden_layers", 28)),
-            num_attention_heads=int(raw.get("num_attention_heads", 28)),
-            num_key_value_heads=int(raw.get("num_key_value_heads", 4)),
-            head_dim=_safe_int(raw.get("head_dim")),
-            max_position_embeddings=int(raw.get("max_position_embeddings", 32768)),
-            rope_theta=float(raw.get("rope_theta", 1000000.0)),
-            rms_norm_eps=float(raw.get("rms_norm_eps", 1e-6)),
+            vocab_size=int(text_config.get("vocab_size", raw.get("vocab_size", 152064))),
+            hidden_size=int(text_config.get("hidden_size", raw.get("hidden_size", 3584))),
+            intermediate_size=int(text_config.get("intermediate_size", raw.get("intermediate_size", 18944))),
+            num_hidden_layers=int(text_config.get("num_hidden_layers", raw.get("num_hidden_layers", 28))),
+            num_attention_heads=int(text_config.get("num_attention_heads", raw.get("num_attention_heads", 28))),
+            num_key_value_heads=int(text_config.get("num_key_value_heads", raw.get("num_key_value_heads", 4))),
+            head_dim=_safe_int(text_config.get("head_dim", raw.get("head_dim"))),
+            max_position_embeddings=int(text_config.get("max_position_embeddings", raw.get("max_position_embeddings", 32768))),
+            rope_theta=float(text_config.get("rope_theta", raw.get("rope_theta", 1000000.0))),
+            rms_norm_eps=float(text_config.get("rms_norm_eps", raw.get("rms_norm_eps", 1e-6))),
             tie_word_embeddings=bool(tie),
             # HF checkpoints are always stored in rotate_half layout.
             # ``rope_interleaved`` in an HF config.json refers to the
             # same distinction, so honour it when present.
-            rope_interleaved=bool(raw.get("rope_interleaved", False)),
+            rope_interleaved=bool(text_config.get("rope_interleaved", raw.get("rope_interleaved", False))),
             model_arch=arch,
             # Gemma 3 sometimes uses ``query_pre_attn_scalar`` as a
             # separate value from ``head_dim`` for the attention
             # score scale. When absent, ``head_dim`` is the fallback.
-            query_pre_attn_scalar=_safe_int(raw.get("query_pre_attn_scalar")),
+            query_pre_attn_scalar=_safe_int(text_config.get("query_pre_attn_scalar", raw.get("query_pre_attn_scalar"))),
             qk_norm_gain=arch == "gemma3",
             mlp_norm_after_block=arch == "gemma3",
             sliding_window=_safe_int(raw.get("sliding_window")),
             attn_logit_softcap=_safe_int(raw.get("attn_logit_softcap"))
             or (50.0 if arch == "gemma3" else None),
+            layer_types=tuple(text_config.get("layer_types") or raw.get("layer_types") or ()) or None,
+            attn_output_gate=bool(text_config.get("attn_output_gate", raw.get("attn_output_gate", False))),
+            linear_conv_kernel_dim=_safe_int(text_config.get("linear_conv_kernel_dim", raw.get("linear_conv_kernel_dim"))) or 0,
+            linear_key_head_dim=_safe_int(text_config.get("linear_key_head_dim", raw.get("linear_key_head_dim"))) or 0,
+            linear_num_key_heads=_safe_int(
+                text_config.get("linear_num_key_heads") or raw.get("linear_num_key_heads")
+                or text_config.get("linear_num_kv_heads") or raw.get("linear_num_kv_heads")
+            ) or 0,
+            linear_num_value_heads=_safe_int(text_config.get("linear_num_value_heads", raw.get("linear_num_value_heads"))) or 0,
         )
 
 
@@ -817,6 +854,30 @@ def make_qwen2_forwarder(
             import sys as _dbg
             r0 = hidden[0]
             n0 = float(np.linalg.norm(r0))
+            # Current RSS in MiB. psutil gives the right value; on Linux
+            # we fall back to ``/proc/self/status``; on macOS ``ru_maxrss``
+            # is peak so it overstates current usage - we use it as a
+            # floor. The number is informational only, not load-bearing.
+            rss_mib = 0.0
+            try:
+                import psutil
+                rss_mib = psutil.Process().memory_info().rss / 1024.0 / 1024.0
+            except Exception:
+                try:
+                    with open("/proc/self/status", "rb") as _f:
+                        for _line in _f:
+                            if _line.startswith(b"VmRSS:"):
+                                rss_mib = float(_line.split()[1]) / 1024.0
+                                break
+                except Exception:
+                    import resource as _dbg_res
+                    _rss = _dbg_res.getrusage(_dbg_res.RUSAGE_SELF).ru_maxrss
+                    # ru_maxrss is peak. On macOS it's bytes; on Linux KiB.
+                    if _rss > 10 * 1024 * 1024:  # bytes
+                        rss_mib = _rss / 1024.0 / 1024.0
+                    else:  # KiB
+                        rss_mib = _rss / 1024.0
+
             if hidden.shape[0] > 1:
                 rN = hidden[-1]
                 d = float(np.abs(r0 - rN).max())
@@ -829,12 +890,14 @@ def make_qwen2_forwarder(
                     f"seq={hidden.shape[0]} hidden={hidden.shape[1]} "
                     f"|n|={n0:.2f}..{nN:.2f} "
                     f"|r0-rN|={d:.4f} cos={cos:.4f} "
-                    f"adj_diff mean={d_mean:.4f} max={d_max:.4f}\n"
+                    f"adj_diff mean={d_mean:.4f} max={d_max:.4f} "
+                    f"rss={rss_mib:.0f}MiB\n"
                 )
             else:
                 _dbg.stderr.write(
                     f"[dbg L{idx:2d} arch={config.model_arch}] "
-                    f"seq={hidden.shape[0]} hidden={hidden.shape[1]} |n|={n0:.2f}\n"
+                    f"seq={hidden.shape[0]} hidden={hidden.shape[1]} "
+                    f"|n|={n0:.2f} rss={rss_mib:.0f}MiB\n"
                 )
             _dbg.stderr.flush()
         state["hidden"] = hidden
