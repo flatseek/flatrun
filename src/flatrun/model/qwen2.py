@@ -503,6 +503,8 @@ def make_qwen2_forwarder(
     config: Qwen2Config,
     *,
     dtype: str = "float32",
+    enable_dequant_cache: bool = False,
+    memory_trace: bool = False,
 ) -> Callable[[LayerDescriptor, LayerHandles, KVCache], np.ndarray]:
     """Return a ``ForwardFn`` that runs a Qwen2 / Llama forward pass.
 
@@ -516,6 +518,20 @@ def make_qwen2_forwarder(
 
     Activations are computed in float32 regardless of the storage
     dtype. ``dtype`` only controls how weights are materialised.
+
+    ``enable_dequant_cache`` (default ``False``) controls streaming
+    behaviour. When ``False`` every layer's weights are dequantized
+    fresh and released as soon as the layer returns - the Python
+    heap stays nearly constant and the runtime operates on one
+    layer at a time. When ``True`` dequantized float32 buffers are
+    cached by on-disk tensor name and held until the process exits,
+    trading RAM for speed (no repeated dequant on a second pass
+    over the same weight). The cache is bounded only by the
+    number of distinct tensors the forwarder touches.
+
+    ``memory_trace`` (default ``False``) prints per-layer memory
+    diagnostics to stderr - useful for verifying streaming mode
+    on large models.
     """
     np_dtype = np.dtype(dtype)
     head_dim = config.head_dim or (config.hidden_size // config.num_attention_heads)
@@ -531,10 +547,14 @@ def make_qwen2_forwarder(
     kv_dim = n_kv_heads * head_dim
     last_index = config.num_hidden_layers - 1
 
-    # Per-forwarder dequant cache, keyed on the on-disk tensor name so
-    # different layers keep separate entries. Without it every step
-    # re-dequantises every weight it touches.
-    dequant_cache: dict[str, np.ndarray] = {}
+    # Dequant cache is opt-in. When disabled (the default) the
+    # forwarder runs in pure streaming mode: every layer's weights
+    # are dequantized fresh on first use, the result is consumed
+    # by the matmul, and the only references in scope are local
+    # Python variables that the garbage collector frees when the
+    # decoder block returns. ``dequant_cache`` stays ``None`` so
+    # the cache lookup path is a single ``is None`` check.
+    dequant_cache: dict[str, np.ndarray] | None = {} if enable_dequant_cache else None
 
     cos_cache, sin_cache = _precompute_rope(
         head_dim=head_dim,
@@ -543,6 +563,80 @@ def make_qwen2_forwarder(
     )
 
     state: dict[str, np.ndarray | None] = {"hidden": None, "embed": None}
+
+    def _approx_python_heap_mib() -> float:
+        """Sum the bytes of all reachable ``ndarray`` instances.
+
+        Used by :func:`_print_memory_trace` to estimate how much of
+        the resident set is Python objects versus the OS mmap cache.
+        Walks ``gc.get_objects()`` which is itself O(n) - so we only
+        call it from the trace path, never on the hot loop.
+        """
+        import gc
+        total = 0
+        for obj in gc.get_objects():
+            if isinstance(obj, np.ndarray):
+                total += int(obj.nbytes)
+        return total / 1024.0 / 1024.0
+
+    def _kv_cache_mib(kv: "KVCache") -> float:
+        """Estimate KV cache bytes by summing all stored entry nbytes."""
+        total = 0
+        for entries in kv._per_layer:  # type: ignore[attr-defined]
+            for entry in entries:
+                total += int(entry.k.nbytes) + int(entry.v.nbytes)
+        return total / 1024.0 / 1024.0
+
+    def _print_memory_trace(
+        layer_idx: int,
+        cache: "dict[str, np.ndarray] | None",
+        kv: "KVCache",
+        hidden: np.ndarray,
+    ) -> None:
+        """Write a single line of per-layer memory diagnostics to stderr.
+
+        Five numbers per line, in the format the project documents
+        in ``docs/limitations.md``:
+
+            L{idx} RSS=... Python=... Dequant=... KV=... hidden=...
+
+        ``RSS`` is the OS resident set (``psutil`` / ``/proc/self/status``
+        fallback). ``Python`` is the sum of ``np.ndarray.nbytes`` for all
+        reachable arrays - a useful proxy for the dequantized cache
+        plus the rest of the heap. ``Dequant`` is the bytes held in
+        the dequant cache alone. ``KV`` is the bytes held in the
+        per-layer KV cache. ``hidden`` is the bytes of the layer's
+        output tensor (the only array that intentionally survives
+        this layer).
+        """
+        import sys as _sys
+        rss_mib = 0.0
+        try:
+            import psutil
+            rss_mib = psutil.Process().memory_info().rss / 1024.0 / 1024.0
+        except Exception:
+            try:
+                with open("/proc/self/status", "rb") as _f:
+                    for _line in _f:
+                        if _line.startswith(b"VmRSS:"):
+                            rss_mib = float(_line.split()[1]) / 1024.0
+                            break
+            except Exception:
+                pass
+        py_mib = _approx_python_heap_mib()
+        cache_mib = 0.0
+        if cache is not None:
+            for _arr in cache.values():
+                cache_mib += int(_arr.nbytes)
+            cache_mib /= 1024.0 * 1024.0
+        kvmib = _kv_cache_mib(kv)
+        hidden_mib = int(hidden.nbytes) / 1024.0 / 1024.0
+        _sys.stderr.write(
+            f"L{layer_idx:2d} RSS={rss_mib:7.1f}MiB "
+            f"Python={py_mib:6.1f}MiB Dequant={cache_mib:5.1f}MiB "
+            f"KV={kvmib:5.1f}MiB hidden={hidden_mib:5.1f}MiB\n"
+        )
+        _sys.stderr.flush()
 
     def _embedding(handles: LayerHandles) -> np.ndarray:
         """Fetch the token embedding table as ``(vocab, hidden)``."""
@@ -704,8 +798,25 @@ def make_qwen2_forwarder(
         # the rare large-magnitude activation.
         silu_gate = gate / (1.0 + np.exp(-np.clip(gate, -80.0, 80.0)))
         mlp_out = (silu_gate * up) @ down_w.astype(np.float32).T
-
-        return residual + mlp_out
+        out = residual + mlp_out
+        # Release every per-layer weight and intermediate so the
+        # Python heap does not retain the previous layer once the
+        # next one starts. ``del`` is the only way to be sure the
+        # references are gone before ``_decoder_block`` returns; GC
+        # alone would still see them via stack inspection.
+        del (
+            q_w, k_w, v_w, qkv_w, qkv, q, k, v,
+            q_norm_w, k_norm_w, gate_w, up_w, down_w,
+            gateup, gate, up, silu_gate, mlp_out, x,
+            attn_out, o_w, residual, attn_norm_w, mlp_norm_w,
+        )
+        if config.quant_mlx_4bit or dequant_cache is None:
+            # Dequant buffer for this layer is now out of scope; nudge
+            # CPython to actually return the page frames. Cheap when
+            # the cache is None; meaningful when the cache is on.
+            import gc as _gc
+            _gc.collect()
+        return out
 
     def _gemma3_decoder_block(
         idx: int,
@@ -851,6 +962,18 @@ def make_qwen2_forwarder(
             f"model.layers.{idx}.post_feedforward_layernorm.weight"
         ].as_numpy().astype(np.float32)
         hidden = _gemma3_norm(hidden, post_mlp_norm_w, config.rms_norm_eps)
+        del (
+            q_w, k_w, v_w, qkv_w, qkv, q, k, v,
+            q_norm_w, k_norm_w, attn_out, o_w,
+            attn_norm_w, pre_mlp_norm_w,
+            gate_w, up_w, down_w, gateup, gate, up,
+            silu_gate, mlp_out, x, residual, k_full, v_full, k_hist, v_hist,
+            post_mlp_norm_w,
+        )
+        if config.quant_mlx_4bit or dequant_cache is None:
+            import gc as _gc
+            _gc.collect()
+        return hidden
         return hidden
 
     def _qwen35_full_attention_block(
@@ -986,7 +1109,19 @@ def make_qwen2_forwarder(
         up = gateup[:, inter:]
         silu_gate = gate / (1.0 + np.exp(-np.clip(gate, -80.0, 80.0)))
         mlp_out = (silu_gate * up) @ down_w.astype(np.float32).T
-        return residual + mlp_out
+        out = residual + mlp_out
+        del (
+            q_w, k_w, v_w, qkv_w, qkv, q, k, v,
+            q_norm_w, k_norm_w,
+            gate_w, up_w, down_w, gateup, gate, up,
+            silu_gate, mlp_out, x, residual,
+            attn_out, o_w, attn_norm_w, post_attn_norm_w,
+            k_full, v_full, k_hist, v_hist,
+        )
+        if config.quant_mlx_4bit or dequant_cache is None:
+            import gc as _gc
+            _gc.collect()
+        return out
 
     def _qwen35_decoder_block(
         idx: int,
@@ -1054,14 +1189,12 @@ def make_qwen2_forwarder(
             hidden = _gemma3_decoder_block(idx, handles, hidden, kv)
         else:
             hidden = _decoder_block(idx, handles, hidden, kv)
+        if memory_trace:
+            _print_memory_trace(idx, dequant_cache, kv, hidden)
         if getattr(config, "debug_trace", False):
             import sys as _dbg
             r0 = hidden[0]
             n0 = float(np.linalg.norm(r0))
-            # Current RSS in MiB. psutil gives the right value; on Linux
-            # we fall back to ``/proc/self/status``; on macOS ``ru_maxrss``
-            # is peak so it overstates current usage - we use it as a
-            # floor. The number is informational only, not load-bearing.
             rss_mib = 0.0
             try:
                 import psutil
@@ -1074,14 +1207,7 @@ def make_qwen2_forwarder(
                                 rss_mib = float(_line.split()[1]) / 1024.0
                                 break
                 except Exception:
-                    import resource as _dbg_res
-                    _rss = _dbg_res.getrusage(_dbg_res.RUSAGE_SELF).ru_maxrss
-                    # ru_maxrss is peak. On macOS it's bytes; on Linux KiB.
-                    if _rss > 10 * 1024 * 1024:  # bytes
-                        rss_mib = _rss / 1024.0 / 1024.0
-                    else:  # KiB
-                        rss_mib = _rss / 1024.0
-
+                    pass
             if hidden.shape[0] > 1:
                 rN = hidden[-1]
                 d = float(np.abs(r0 - rN).max())

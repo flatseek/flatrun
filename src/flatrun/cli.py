@@ -473,6 +473,25 @@ def _build_argparser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser
              "metrics to stderr. Useful for cross-checking a model's "
              "forwarder against a reference (LM Studio, llama.cpp).",
     )
+    shared.add_argument(
+        "--dequant-cache",
+        choices=["on", "off"],
+        default="off",
+        help="Keep dequantized weight tensors in Python heap across "
+             "layers. ``off`` (default) is true streaming: every layer "
+             "is dequantized fresh and the result is released as soon "
+             "as the layer finishes, so the Python heap stays nearly "
+             "constant. ``on`` trades RAM for speed by caching every "
+             "dequantized weight until the process exits. Set ``on`` "
+             "only for short-running experiments on small models.",
+    )
+    shared.add_argument(
+        "--memory-trace",
+        action="store_true",
+        help="Print OS RSS, Python heap, mmap resident, dequant cache, "
+             "and KV cache size after every decoder block. Use with "
+             "--dequant-cache off to verify streaming behaviour.",
+    )
 
     parser = argparse.ArgumentParser(
         prog="flatrun",
@@ -650,7 +669,8 @@ def _load_model_bundle(args, parser: argparse.ArgumentParser) -> dict:
         qcfg.quant_mlx_4bit = fmt == "mlx"
         qcfg.quant_gguf = None
         qcfg.debug_trace = args.debug
-    forwarder = make_qwen2_forwarder(qcfg)
+    enable_cache = args.dequant_cache == "on"
+    forwarder = make_qwen2_forwarder(qcfg, enable_dequant_cache=enable_cache, memory_trace=args.memory_trace)
 
     scheduler = loaded.runtime.build_scheduler(
         loaded.manifest.layers,
@@ -986,7 +1006,8 @@ def cmd_chat(args) -> int:
         qcfg.quant_mlx_4bit = fmt == "mlx"
         qcfg.quant_gguf = None
         qcfg.debug_trace = args.debug
-    forwarder = make_qwen2_forwarder(qcfg)
+    enable_cache = args.dequant_cache == "on"
+    forwarder = make_qwen2_forwarder(qcfg, enable_dequant_cache=enable_cache, memory_trace=args.memory_trace)
 
     # 4. Stream one prompt + max_new tokens.
     scheduler = loaded.runtime.build_scheduler(
