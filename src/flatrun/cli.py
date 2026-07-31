@@ -176,6 +176,18 @@ class LiveCursor:
 
     def __enter__(self) -> "LiveCursor":
         self._stop = False
+        # Reserve a dedicated stderr line BELOW the streamed stdout
+        # content. Two newlines moves the stderr cursor 2 lines past
+        # its current position so the cursor's per-tick ``\r`` cannot
+        # accidentally land on the streamed-content line (which was
+        # the bug that produced ``⠏ssistant:``). The first ``\n``
+        # moves stderr to a fresh line; the second adds a blank
+        # separator; the cursor then pulses on the line after that.
+        try:
+            self._stream.write("\n\n")
+            self._stream.flush()
+        except Exception:
+            pass
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         return self
@@ -184,8 +196,11 @@ class LiveCursor:
         self._stop = True
         if self._thread is not None:
             self._thread.join(timeout=_LIVE_CURSOR_INTERVAL * 3)
+        # Clear the cursor cell, then ``\n`` so the next line on
+        # stderr becomes the new current line. After this, ``cmd_chat``
+        # prints the thinking block on the next stdout write.
         try:
-            self._stream.write("\r" + " " * 4 + "\r")
+            self._stream.write("\r" + " " * 4 + "\n")
             self._stream.flush()
         except Exception:
             pass
@@ -195,10 +210,12 @@ class LiveCursor:
         while not self._stop:
             frame = _LIVE_CURSOR_FRAMES[i % len(_LIVE_CURSOR_FRAMES)]
             try:
-                # Yellow cursor at the LEFT of the line. Using
-                # ``\r`` rewinds to column 0 each tick, so the
-                # streamed text on the same line is left intact
-                # after the cursor overwrites only the first cell.
+                # Yellow cursor at column 0 of its own stderr line.
+                # ``\r`` rewinds to the start of the cursor line (which
+                # is separated from the streamed stdout line by the
+                # blank line reserved in ``__enter__``). Each frame
+                # overwrites only the first cell, so the cursor
+                # visually pulses in place.
                 self._stream.write(f"\r{_C_YELLOW}{frame}{_C_END}")
                 self._stream.flush()
             except Exception:
