@@ -699,9 +699,55 @@ def _resolve_model_paths(args, parser: argparse.ArgumentParser) -> tuple[Path, P
 
 
 def _pick_gguf_file(model_dir: Path, parser: argparse.ArgumentParser) -> Path:
+    """Pick the LLM GGUF in a directory, skipping multimodal helpers.
+
+    LM Studio stores vision-language models with two GGUF files
+    side by side: the base LLM (e.g. ``Bonsai-27B-Q1_0.gguf``)
+    and the multimodal projection adapter
+    (e.g. ``Bonsai-27B-mmproj-BF16.gguf``). flatrun is text-only,
+    so loading the mmproj file would waste memory and produce
+    garbage. The picker silently skips files whose stem contains
+    ``mmproj`` / ``mm-proj`` / ``vision`` / ``clip`` / ``projection``;
+    if only ``mmproj`` files exist, fall through and let the user
+    see the original 'multiple GGUF files' error so they can
+    correct the path manually.
+    """
+    skip_patterns = (
+        "mmproj",
+        "mm-proj",
+        "mm_proj",
+        "vision",
+        "clip",
+        "projection",
+        "imgproj",
+    )
+
+    def is_llm(p: Path) -> bool:
+        stem = p.stem.lower()
+        return not any(pat in stem for pat in skip_patterns)
+
     candidates = sorted(model_dir.glob("*.gguf"))
     if not candidates:
         parser.exit(1, f"No .gguf file in {model_dir}\n")
+    llm_candidates = [p for p in candidates if is_llm(p)]
+    if len(llm_candidates) == 1:
+        return llm_candidates[0]
+    if len(candidates) > 1 and not llm_candidates:
+        # Only mmproj-shaped files exist - tell the user to point
+        # at the base model explicitly.
+        parser.exit(
+            1,
+            f"All GGUF files in {model_dir} look like multimodal "
+            f"projection helpers ({[p.name for p in candidates]}); "
+            f"flatrun is text-only. Point --model at the base model "
+            f"file directly.\n",
+        )
+    if len(llm_candidates) > 1:
+        parser.exit(
+            1,
+            f"Multiple LLM GGUF files in {model_dir}: "
+            f"{[p.name for p in llm_candidates]}; pass a single file path.\n",
+        )
     return candidates[0]
 
 

@@ -113,11 +113,41 @@ def load_huggingface(
         if not shards:
             gguf = sorted(src.glob("*.gguf"))
             if gguf:
-                if len(gguf) > 1:
+                # LM Studio stores vision-language models with two
+                # GGUF files: the base LLM and a ``mmproj`` /
+                # ``vision`` / ``clip`` / ``projection`` adapter.
+                # flatrun is text-only, so prefer the LLM file.
+                mmproj_markers = (
+                    "mmproj",
+                    "mm-proj",
+                    "mm_proj",
+                    "vision",
+                    "clip",
+                    "projection",
+                    "imgproj",
+                )
+
+                def _is_llm_only(p: Path) -> bool:
+                    return not any(m in p.stem.lower() for m in mmproj_markers)
+
+                llm_only = [p for p in gguf if _is_llm_only(p)]
+                if len(llm_only) == 1:
+                    shards = llm_only
+                elif llm_only:
                     raise ConfigurationError(
-                        f"Multiple GGUF files in {src}; pass a single file path"
+                        f"Multiple LLM GGUF files in {src}: "
+                        f"{[p.name for p in llm_only]}; "
+                        f"pass a single file path"
                     )
-                shards = gguf
+                elif len(gguf) > 1:
+                    raise ConfigurationError(
+                        f"Multiple GGUF files in {src} but none look "
+                        f"like a base LLM (the others look like mmproj / "
+                        f"vision / clip / projection helpers). Point "
+                        f"--model at the base model file directly."
+                    )
+                else:
+                    shards = gguf
             else:
                 raise ConfigurationError(
                     f"No shards matching {prefer_shard_pattern!r} or *.gguf in {src}"
