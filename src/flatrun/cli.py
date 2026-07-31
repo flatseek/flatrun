@@ -84,6 +84,27 @@ from flatrun.utils.errors import ConfigurationError
 _SPINNER_FRAMES = "-\\|/"
 _SPINNER_INTERVAL = 0.1  # seconds
 
+# ANSI colour codes used by the chat REPL. Centralised so the chat
+# output is consistent and easy to tweak without grepping the
+# call sites. ``\033[0m`` resets the active style.
+_C_USER = "\033[36m"     # cyan   - "You:" label
+_C_USER_END = "\033[0m"
+_C_ASSISTANT = "\033[32m"  # green  - "Assistant:" label
+_C_ASSISTANT_END = "\033[0m"
+_C_DIM = "\033[2m"          # dim
+_C_GREY = "\033[90m"        # bright-black - "grey" thinking body
+_C_ITALIC = "\033[3m"       # italic  - thinking body
+_C_END = "\033[0m"
+
+# Braille-pattern frames for the live cursor that pulses at the
+# end of a streaming token run. ``\r`` rewinds the line and the
+# pattern advances each tick, so it reads as a spinning cursor
+# without flickering the rest of the line. The pulse cadence is
+# ~8 fps which matches what Claude Code does for its "thinking"
+# indicator.
+_LIVE_CURSOR_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_LIVE_CURSOR_INTERVAL = 0.12  # seconds
+
 
 class Spinner:
     """Single-line, stderr-only animation that lives for the duration
@@ -134,6 +155,55 @@ class Spinner:
             time.sleep(_SPINNER_INTERVAL)
 
 
+class LiveCursor:
+    """Pulsing braille cursor at the end of a streaming token line.
+
+    Used during ``--max-new`` generation: tokens stream on ``stdout``
+    in place, and this class writes a single dim braille frame to
+    ``stderr`` via ``\\r`` every ``_LIVE_CURSOR_INTERVAL`` seconds.
+    The cursor sits at the bottom-right of the user's terminal
+    (where their eye is) and pulses while the model is still
+    thinking, so the response never looks frozen. When ``__exit__``
+    runs the cursor is cleared with a single overwrite and the
+    finished transcript starts on a clean line.
+    """
+
+    def __init__(self, stream=None) -> None:
+        self._stream = stream or sys.stderr
+        self._thread = None
+        self._stop = False
+
+    def __enter__(self) -> "LiveCursor":
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._stop = True
+        if self._thread is not None:
+            self._thread.join(timeout=_LIVE_CURSOR_INTERVAL * 3)
+        try:
+            self._stream.write("\r" + " " * 4 + "\r")
+            self._stream.flush()
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        i = 0
+        while not self._stop:
+            frame = _LIVE_CURSOR_FRAMES[i % len(_LIVE_CURSOR_FRAMES)]
+            try:
+                # Dim the cursor so it doesn't compete with the
+                # streamed text for visual attention.
+                self._stream.write(f"\r{_C_DIM}{frame}{_C_END}")
+                self._stream.flush()
+            except Exception:
+                return
+            i += 1
+            time.sleep(_LIVE_CURSOR_INTERVAL)
+
+
 # Patterns we recognise as "this is a thinking block". The first match
 # wins; everything outside it is the user-visible reply. Order matters
 # because the Qwen3 format wraps the whole trace in
@@ -150,6 +220,11 @@ def _split_thinking(text: str) -> tuple[str | None, str]:
 
     Returns ``(thinking, answer)``. If no block is found,
     ``thinking`` is ``None`` and the whole input is the answer.
+
+    The ``<think>`` and ``</think>`` markers themselves are stripped
+    from the returned thinking string; only the body remains. The
+    body is run through :func:`_flatten_thinking` so multi-line chain
+    of thought renders as a single line in the REPL.
     """
     for open_tag, close_tag in _THINK_PATTERNS:
         start = text.find(open_tag)
@@ -159,14 +234,27 @@ def _split_thinking(text: str) -> tuple[str | None, str]:
         if end == -1:
             # Unterminated block - treat everything after ``open_tag``
             # as thinking and the rest as answer (best effort).
-            thinking = text[start + len(open_tag) :]
+            thinking = _flatten_thinking(text[start + len(open_tag) :])
             answer = text[:start].rstrip()
-            return thinking.strip() or None, answer
-        thinking = text[start + len(open_tag) : end]
+            return (thinking or None), answer
+        thinking = _flatten_thinking(text[start + len(open_tag) : end])
         # Everything before the block plus everything after it.
         answer = text[:start] + text[end + len(close_tag) :]
-        return thinking.strip() or None, answer.lstrip()
+        return (thinking or None), answer.lstrip()
     return None, text
+
+
+def _flatten_thinking(s: str) -> str:
+    """Return ``s`` with runs of whitespace collapsed to a single space.
+
+    Used by :func:`_split_thinking` to render a multi-line chain of
+    thought as a single ``[dim][italic][grey]`` line in the REPL
+    rather than as a tall block that scrolls the transcript
+    off-screen. Trailing / leading whitespace is removed. If the
+    input is empty the result is empty too.
+    """
+    import re as _re
+    return _re.sub(r"\s+", " ", s).strip() or ""
 
 
 def _detect_format(model_dir: Path, gguf_path: Path | None = None) -> str:
@@ -833,7 +921,11 @@ def cmd_run(args) -> int:
     if generated:
         thinking, answer = _split_thinking(raw_text)
         if thinking:
-            print(f"\n\033[2mThinking:\n{thinking}\n\033[0m")
+            # Dim grey italic for the chain-of-thought. The block
+            # markers themselves are stripped by ``_split_thinking``;
+            # newlines are collapsed by ``_flatten_thinking`` so the
+            # trace fits on one line under the generated answer.
+            print(f"\n{_C_DIM}{_C_ITALIC}{_C_GREY}Thinking: {thinking}{_C_END}")
         print(f"\nGenerated text: {answer!r}")
     if args.profile and len(step_times) > 1:
         first = step_times[0]
@@ -881,7 +973,7 @@ def cmd_chat(args) -> int:
     turn = 0
     while True:
         try:
-            user_text = input("You: ")
+            user_text = input(f"{_C_USER}You: {_C_USER_END}")
         except (EOFError, KeyboardInterrupt):
             print("\nBye.")
             break
@@ -916,14 +1008,19 @@ def cmd_chat(args) -> int:
         bundle["executor"].kv_cache.reset()
         turn += 1
         t0 = time.perf_counter()
-        # Print "Assistant: " once, then stream tokens onto the same
-        # line. ``--no-sample`` and ``--temperature`` etc. are honoured
-        # by ``_make_sampler`` inside ``_generate_continuation``.
-        print("Assistant: ", end="", flush=True)
-        generated, _, _ = _generate_continuation(
-            bundle, args, prompt_ids, args.max_new,
-            stream=lambda t: print(t, end="", flush=True),
-        )
+        # Print "Assistant: " once in green, then stream tokens onto
+        # the same line. ``LiveCursor`` pulses a braille cursor to
+        # ``stderr`` while the forwarder is working so the user can
+        # see the model is still thinking. ``--no-sample`` and
+        # ``--temperature`` etc. are honoured by ``_make_sampler``
+        # inside ``_generate_continuation``.
+        sys.stdout.write(f"{_C_ASSISTANT}Assistant: {_C_ASSISTANT_END}")
+        sys.stdout.flush()
+        with LiveCursor():
+            generated, _, _ = _generate_continuation(
+                bundle, args, prompt_ids, args.max_new,
+                stream=lambda t: print(t, end="", flush=True),
+            )
         print()  # newline after the streamed reply
         dt = time.perf_counter() - t0
         raw_text = tokenizer.decode(generated)
@@ -933,8 +1030,13 @@ def cmd_chat(args) -> int:
                 reply_text = reply_text.split(stop, 1)[0]
                 break
         if thinking:
-            print(f"\033[2mThinking:\n{thinking}\n\033[0m")
-        print(f"Assistant: {reply_text}")
+            # Dim + grey + italic chain-of-thought on its own line.
+            # ``_split_thinking`` already stripped the markers and
+            # ``_flatten_thinking`` collapsed newlines.
+            print(f"\n{_C_DIM}{_C_ITALIC}{_C_GREY}Thinking: {thinking}{_C_END}")
+        # ``Assistant:`` in green; the streamed reply is already on
+        # the line above so we just print it here for the REPL log.
+        print(f"{_C_ASSISTANT}Assistant: {reply_text}{_C_ASSISTANT_END}")
         print(f"  ({len(generated)} tokens, {dt:.1f}s, {len(generated) / max(dt, 1e-3):.1f} tok/s)\n")
         messages.append({"role": "assistant", "content": reply_text})
 
