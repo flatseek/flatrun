@@ -52,6 +52,16 @@ safetensors = [
 native = [
     "pybind11>=2.10",
 ]
+# Optional. Required by ``flatrun serve`` — installs FastAPI + uvicorn
+# for the OpenAI / Anthropic-compatible HTTP server. The base install
+# deliberately does not depend on these so a wheel used for embedded
+# inference (or in a serverless container without an HTTP listener)
+# stays light.
+serve = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.5",
+]
 
 [project.urls]
 Homepage = "https://flatseek.io"

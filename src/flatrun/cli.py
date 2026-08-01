@@ -864,13 +864,52 @@ def main(argv: list[str] | None = None) -> int:
     # Detect that and prepend ``run`` so the legacy CLI works.
     if len(argv) == 0:
         argv = ["run"]
-    elif argv[0] not in ("run", "chat", "-h", "--help"):
+    elif argv[0] not in ("run", "chat", "serve", "-h", "--help"):
         argv = ["run", *argv]
     args = parser.parse_args(argv)
     handler = getattr(args, "_handler", None)
     if handler == "chat":
         return cmd_chat(args)
+    if handler == "serve":
+        return cmd_serve(args)
     return cmd_run(args)
+
+
+def cmd_serve(args) -> int:
+    """Run the OpenAI/Anthropic-compatible HTTP server.
+
+    The server is implemented in :mod:`flatrun.serve`; this handler
+    is just the CLI glue that parses the flags, builds the config,
+    and hands off to uvicorn. ``uvicorn`` is the canonical ASGI
+    runner for FastAPI; it ships with the ``[serve]`` extra so the
+    base install stays light.
+    """
+    try:
+        import uvicorn  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise ConfigurationError(
+            "The 'flatrun serve' command requires the [serve] extra. "
+            "Install it with: pip install 'flatrun[serve]'"
+        ) from exc
+    # Lazy-import so the ``[serve]`` extra is only required when
+    # actually running the server.
+    from flatrun.serve import ServerConfig, build_app
+
+    config = ServerConfig(
+        model=args.model,
+        tokenizer=args.tokenizer,
+        cache_mb=args.cache_mb,
+        backend=args.backend,
+        dequant_cache=args.dequant_cache == "on",
+        host=args.host,
+        port=args.port,
+    )
+    app = build_app(config)
+    # ``uvicorn.run`` blocks until the server is shut down (Ctrl-C
+    # or SIGTERM). The model is loaded inside the app's startup
+    # handler so the first HTTP request never pays that cost.
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    return 0
 
 
 def _build_argparser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
@@ -1132,9 +1171,10 @@ def _build_argparser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser
         prog="flatrun",
         description=(
             "FlatRun - streaming inference runtime. "
-            "Use 'flatrun run' for one-shot prompts or 'flatrun chat' "
-            "for an interactive REPL. Without a subcommand, the "
-            "legacy one-shot ``run`` mode is used."
+            "Use 'flatrun run' for one-shot prompts, 'flatrun chat' "
+            "for an interactive REPL, or 'flatrun serve' to expose "
+            "OpenAI/Anthropic-compatible HTTP endpoints. Without a "
+            "subcommand, the legacy one-shot ``run`` mode is used."
         ),
     )
     subparsers = parser.add_subparsers(dest="command")
@@ -1178,6 +1218,34 @@ def _build_argparser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser
         help="Do not append previous turns to the prompt. Each reply is a one-shot call.",
     )
     chat_parser.set_defaults(_handler="chat")
+
+    # ``serve`` - HTTP server with OpenAI/Anthropic-compatible APIs.
+    # Reuses ``shared`` for the model/backend/cache flags so users
+    # see the same knobs as ``run`` / ``chat``.
+    serve_parser = subparsers.add_parser(
+        "serve",
+        parents=[shared],
+        add_help=True,
+        help=(
+            "Run an HTTP server exposing OpenAI- and Anthropic-compatible "
+            "endpoints (POST /v1/chat/completions, /v1/completions, "
+            "/v1/messages, GET /v1/models). Requires 'pip install "
+            "flatrun[serve]'."
+        ),
+    )
+    serve_parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Interface to bind. Default 127.0.0.1 (loopback only).",
+    )
+    serve_parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="TCP port. Default 8080.",
+    )
+    serve_parser.set_defaults(_handler="serve")
 
     return parser, shared
 

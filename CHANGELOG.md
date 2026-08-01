@@ -14,6 +14,19 @@ to the project — every fix from the audit cycle is listed below in
 the order it landed, with the measured impact where the bench
 captured it.
 
+### New since 0.1.1
+
+- **`flatrun serve` — OpenAI- and Anthropic-compatible HTTP server.**
+  Exposes the same loaded model on `POST /v1/chat/completions`,
+  `POST /v1/completions`, `POST /v1/messages`, and `GET /v1/models`
+  with SSE streaming on both surfaces. Reasoning content (Qwen3-style
+  `<think>...</think>` blocks) is split into its own SSE delta /
+  Anthropic `thinking` content block. FastAPI + uvicorn live in the
+  new `[serve]` extra so the base wheel stays light; the OpenAI
+  Python SDK (>= 1.0) and Anthropic Python SDK work unmodified by
+  pointing `base_url` at the server. See `docs/serve.md` for
+  endpoint-by-endpoint examples.
+
 ### What this version ships
 
 - **Streaming runtime** (`flatrun.runtime`): mmap-based tensor

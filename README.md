@@ -67,6 +67,21 @@ north-central part of the country along the Seine River and is one of
 Europe's major cultural, historical, and economic centers.
 
 ```
+
+Want to expose the same model over HTTP? `flatrun serve` ships
+OpenAI- and Anthropic-compatible endpoints on the same port:
+
+```bash
+pip install 'flatrun[serve]'
+flatrun serve --model smoll.gguf --port 8080
+# then in Python:
+# from openai import OpenAI
+# client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="not-needed")
+```
+
+See [`docs/serve.md`](docs/serve.md) for the full endpoint list and
+streaming-event shapes.
+
 ---
 # Overview
 
@@ -95,6 +110,7 @@ It provides a transparent streaming runtime where every stage—from tensor load
 - GGUF, SafeTensors, and MLX support
 - Q1/Q4/Q5/Q6/Q8 quantization
 - Python API and interactive chat
+- OpenAI- and Anthropic-compatible HTTP server (`flatrun serve`)
 - Layer profiler and memory tracing
 ---
 
