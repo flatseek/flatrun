@@ -79,7 +79,7 @@ where = ["src"]
 include = ["flatrun*"]
 
 [tool.setuptools.package-data]
-"flatrun_native" = ["*.h"]
+"flatrun_native" = ["**/*.h", "kernels/*.h"]
 
 [tool.pytest.ini_options]
 testpaths = ["src/flatrun/tests", "src/flatrun_native/tests"]
