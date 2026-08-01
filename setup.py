@@ -56,11 +56,15 @@ ext_modules = []
 if _has_pybind11():
     import pybind11
     pybind11_include = pybind11.get_include()
+    # Use an absolute path for the include dir so the build is
+    # robust to ``python -m build`` and ``pip install`` being
+    # invoked from a directory other than the project root.
+    flatrun_native_include = os.path.join(HERE, "src", "flatrun_native")
     ext_modules = [
         Extension(
             "flatrun_native._C",
-            sources=["src/flatrun_native/_C.cpp"],
-            include_dirs=["src/flatrun_native", pybind11_include],
+            sources=[os.path.join(HERE, "src", "flatrun_native", "_C.cpp")],
+            include_dirs=[flatrun_native_include, pybind11_include],
             extra_compile_args=extra_compile_args,
             language="c++",
             extra_link_args=extra_link_args,
