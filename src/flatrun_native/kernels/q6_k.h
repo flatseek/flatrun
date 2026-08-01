@@ -132,6 +132,11 @@ static inline void dequant_q6_k_naive(
 ) {
     for (std::size_t b = 0; b < n_blocks; ++b) {
         const uint8_t* block = raw + b * 210;
+        // Per-block output slice: out[b * 256 .. b * 256 + 256). The
+        // base offset was wrong before (always 0 within a block), so
+        // block 1 overwrote block 0's output rather than landing in
+        // its own slice.
+        float* out_b = out + b * 256;
         uint16_t d_h;
         std::memcpy(&d_h, block + 208, 2);
         float d = fp16_to_fp32(d_h);
@@ -155,10 +160,10 @@ static inline void dequant_q6_k_naive(
                 int q2 = (ql_h[l]      >> 4)    | (((qhb >> 4) & 3) << 4);
                 int q3 = (ql_h[l + 32] >> 4)    | (((qhb >> 6) & 3) << 4);
 
-                out[base + l]      = d * static_cast<float>(sc_h[is + 0]) * (static_cast<float>(q0) - 32.0f);
-                out[base + l + 32] = d * static_cast<float>(sc_h[is + 2]) * (static_cast<float>(q1) - 32.0f);
-                out[base + l + 64] = d * static_cast<float>(sc_h[is + 4]) * (static_cast<float>(q2) - 32.0f);
-                out[base + l + 96] = d * static_cast<float>(sc_h[is + 6]) * (static_cast<float>(q3) - 32.0f);
+                out_b[base + l]      = d * static_cast<float>(sc_h[is + 0]) * (static_cast<float>(q0) - 32.0f);
+                out_b[base + l + 32] = d * static_cast<float>(sc_h[is + 2]) * (static_cast<float>(q1) - 32.0f);
+                out_b[base + l + 64] = d * static_cast<float>(sc_h[is + 4]) * (static_cast<float>(q2) - 32.0f);
+                out_b[base + l + 96] = d * static_cast<float>(sc_h[is + 6]) * (static_cast<float>(q3) - 32.0f);
             }
         }
     }

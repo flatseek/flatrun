@@ -37,12 +37,13 @@ enabling inference on models larger than available system RAM.
 </div>
 
 ---
-## Try it
+## Try It
 
-Download and inference a sample GGUF model from Hugging Face:
+Download a sample GGUF model from Hugging Face and start an interactive chat:
 
 ```bash
 wget https://huggingface.co/lmstudio-community/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf -O smoll.gguf
+
 flatrun chat --model smoll.gguf
 ```
 
@@ -65,7 +66,6 @@ Paris is the capital and largest city of France. It is located in the
 north-central part of the country along the Seine River and is one of
 Europe's major cultural, historical, and economic centers.
 
-You:
 ```
 ---
 # Overview
