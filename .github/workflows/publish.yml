@@ -25,10 +25,21 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install build pybind11 setuptools
-      - name: Build sdist + wheel (with native extension)
+      - name: Build sdist (with bundled native source)
+        # We only upload the sdist to PyPI. The raw "linux_x86_64"
+        # wheel tag produced by `python -m build` is rejected by
+        # PyPI — it expects a manylinux-compliant wheel produced by
+        # auditwheel inside a manylinux docker. The sdist ships
+        # the C++ source alongside the Python package, so
+        # `pip install flatrun` on the user's machine uses the
+        # host's pybind11 + compiler to build the native extension
+        # at install time. A future change can switch to
+        # cibuildwheel for proper manylinux wheels.
         run: |
           rm -rf dist/ build/
           pip install --no-build-isolation -e ".[native]"
-          python -m build
-      - name: Publish to PyPI
+          python -m build --sdist
+      - name: Publish sdist to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
