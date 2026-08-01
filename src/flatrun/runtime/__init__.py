@@ -13,7 +13,7 @@ from .executor import (
     StreamingExecutor,
     TokenStep,
 )
-from .kv_cache import KVCache, KVEntry
+from .kv_cache import KVCache
 from .memory import MemoryConfig, MemoryManager
 from .runtime import InferenceRuntime, RuntimeConfig, RuntimeStats
 from .scheduler import (
@@ -31,7 +31,6 @@ __all__ = [
     "HandleSource",
     "InferenceRuntime",
     "KVCache",
-    "KVEntry",
     "LayerHandles",
     "LayerScheduler",
     "MemoryConfig",
