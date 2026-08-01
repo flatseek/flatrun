@@ -18,20 +18,21 @@ enabling inference on models larger than available system RAM.
 [![Tests](https://github.com/flatseek/flatrun/workflows/Test/badge.svg)](https://github.com/flatseek/flatrun/actions)
 [![PyPI version](https://img.shields.io/pypi/v/flatrun.svg)](https://pypi.org/project/flatrun/)
 
+
 **GitHub:** https://github.com/flatseek/flatrun
 &nbsp;&middot;&nbsp;
 **Organization:** https://github.com/flatseek
 
-<br><br>
+<br>
 
 **Part of the Flatseek ecosystem**
 
-[Flatseek](https://github.com/flatseek/flatseek) •
-[Flatvec](https://github.com/flatseek/flatvec) •
-[Flatask](https://github.com/flatseek/flatask) •
-[Flatweight](https://github.com/flatseek/flatweight) •
-[Flattune](https://github.com/flatseek/flattune) •
-[Flatlens](https://github.com/flatseek/flatlens)
+[Flatseek](https://github.com/flatseek/flatseek) (Keyword Search) •
+[Flatvec](https://github.com/flatseek/flatvec) (Vector Search) •
+[Flatask](https://github.com/flatseek/flatask) (RAG Runtime) •
+[Flatweight](https://github.com/flatseek/flatweight) (AI Model Storage) •
+[Flattune](https://github.com/flatseek/flattune) (LLM Fine-Tuning) •
+[Flatlens](https://github.com/flatseek/flatlens) (Data Visualization)
 
 </div>
 
