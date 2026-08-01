@@ -36,19 +36,23 @@ enabling inference on models larger than available system RAM.
 </div>
 
 ---
-### See how it work
+## Try it
+
+Download and inference a sample GGUF model from Hugging Face:
 
 ```bash
-flatrun chat --model ./Qwen3-0.6B-Q4_K_M.gguf
+wget https://huggingface.co/lmstudio-community/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf -O smoll.gguf
+flatrun chat --model smoll.gguf
 ```
+
+Example session:
 
 ```text
 Detected format: gguf
-Building tokenizer from GGUF metadata (Qwen3-0.6B-Q4_K_M.gguf) ...
-Tokenizer vocab: 151936
+Building tokenizer from GGUF metadata (SmolLM2-135M-Instruct-Q4_K_M.gguf) ...
+Tokenizer vocab: 49152
 Chat template: Qwen2 ChatML
-  bumping cache from 256 MiB to 512 MiB (largest tensor is 122 MiB)
-Loaded model in 1.62 s; layers=28
+Loaded model in 0.53 s; layers=30
 
 Chat mode (max_new=128/turn, history=True).
 Type your message; Ctrl-D (EOF) or 'exit' to quit.
@@ -57,10 +61,10 @@ You: where is paris?
 
 Assistant:
 Paris is the capital and largest city of France. It is located in the
-north-central part of the country along the Seine River and is known for
-landmarks such as the Eiffel Tower, the Louvre Museum, and Notre-Dame
-Cathedral.
+north-central part of the country along the Seine River and is one of
+Europe's major cultural, historical, and economic centers.
 
+You:
 ```
 ---
 # Overview

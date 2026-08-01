@@ -169,12 +169,16 @@ def test_auto_load_missing_files(tmp_path: Path) -> None:
 
 def test_real_qwen7b_tokenizer_loads() -> None:
     """Round-trip a real string through the production tokenizer."""
-    model_dir = Path(
-        "/Users/judotens/.lmstudio/models/lmstudio-community/"
-        "Qwen2.5-Coder-7B-Instruct-MLX-4bit"
-    )
-    if not (model_dir / "tokenizer.json").is_file():
-        pytest.skip(f"tokenizer.json not found at {model_dir}")
+    # Walk up from the test file location to find a sibling ``models/``
+    # directory at the repo root; skip if no tokenizer is found there.
+    repo_root = Path(__file__).resolve().parents[3]
+    candidates = [
+        repo_root / "models" / "Qwen2.5-Coder-7B-Instruct-MLX-4bit",
+        repo_root.parent / "models" / "Qwen2.5-Coder-7B-Instruct-MLX-4bit",
+    ]
+    model_dir = next((p for p in candidates if (p / "tokenizer.json").is_file()), None)
+    if model_dir is None:
+        pytest.skip("MLX-4bit tokenizer not found in any known location")
     tok = auto_load(model_dir)
     assert len(tok.vocab) > 1000
     ids = tok.encode("def hello():")

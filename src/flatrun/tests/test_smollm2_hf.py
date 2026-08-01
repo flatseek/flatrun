@@ -68,7 +68,9 @@ def test_smollm2_native_runs_end_to_end(smollm2_path: Path) -> None:
     from flatrun.tokenizer import auto_load
 
     loaded = load_huggingface(smollm2_path)
-    tokenizer = auto_load(smollm2_path)
+    # auto_load expects a directory; the GGUF sits inside the cache
+    # directory next to the test file.
+    tokenizer = auto_load(smollm2_path.parent)
 
     backend = get_backend("native")
     # Even when the native backend is unavailable, the CLI should still
