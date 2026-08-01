@@ -1,21 +1,21 @@
-"""End-to-end test that pulls SmolLM2-360M-Instruct Q8_0 from HuggingFace
-and runs a forward pass through the streaming runtime.
+"""End-to-end test that pulls SmolLM2-135M-Instruct Q4_K_M from
+HuggingFace and runs a forward pass through the streaming runtime.
 
 The download is gated behind the ``network`` marker; on CI the test is
 skipped (`pytest -m "not network"` in the workflow). Locally, run with
 ``pytest -m network`` to exercise the full path.
 
-The model is cached next to the test file (``./.cache/smollm2-360m-instruct-q8_0.gguf``)
-on first run; subsequent runs reuse the cached file. The cache is shared
-across all tests so the ~360 MB download happens once.
+The model is cached next to the test file (``./.cache/``) on first run;
+subsequent runs reuse the cached file. The cache is shared across all
+tests so the ~75 MB download happens once.
 
-Output is checked against trimmed LM Studio reference text (the model
-itself is fixed, so the answer to the trivial prompt is reproducible).
+SmolLM2-135M is bounded by the disk cap (the default 256 MiB cache
+holds the whole model easily) so the runtime streams the embeddings
+and one decoder layer at a time without eviction.
 """
 
 from __future__ import annotations
 
-import hashlib
 import os
 import sys
 from pathlib import Path
@@ -27,10 +27,10 @@ import pytest
 HERE = Path(__file__).resolve().parent
 CACHE_DIR = HERE / ".cache"
 SMOLLM2_URL = (
-    "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct-GGUF/"
-    "resolve/main/smollm2-360m-instruct-q8_0.gguf"
+    "https://huggingface.co/lmstudio-community/SmolLM2-135M-Instruct-GGUF/"
+    "resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf"
 )
-SMOLLM2_NAME = "smollm2-360m-instruct-q8_0.gguf"
+SMOLLM2_NAME = "SmolLM2-135M-Instruct-Q4_K_M.gguf"
 
 
 @pytest.fixture(scope="session")
@@ -87,21 +87,21 @@ def test_smollm2_native_runs_end_to_end(smollm2_path: Path) -> None:
     assert step.last_hidden.shape == (len(tokens), loaded.config.vocab_size)
     # Greedy: take the argmax of the last token's logits.
     next_id = int(np.argmax(step.last_hidden[-1]))
-    assert next_id in tokenizer.added_tokens_list or 0 <= next_id < loaded.config.vocab_size
+    assert 0 <= next_id < loaded.config.vocab_size
 
 
 @pytest.mark.network
-def test_smollm2_q8_0_uses_native_kernel(smollm2_path: Path) -> None:
-    """Native backend reports it can handle the Q8_0 weights in SmolLM2."""
+def test_smollm2_q4_k_uses_native_kernel(smollm2_path: Path) -> None:
+    """Native backend reports it can handle the Q4_K weights in SmolLM2."""
     from flatrun.runtime.backend import get_backend
 
     backend = get_backend("native")
     # Whether the native extension is built or not, the Python backend
-    # should still be able to handle Q8_0 (the python dispatch falls
+    # should still be able to handle Q4_K (the python dispatch falls
     # back to the numpy dequant).
-    assert "Q8_0" in get_backend("python").supported_quants
+    assert "Q4_K" in get_backend("python").supported_quants
     if backend.available:
-        assert "Q8_0" in backend.supported_quants
+        assert "Q4_K" in backend.supported_quants
 
 
 # Markers contract — keep aligned with pyproject.toml's pytest markers.
