@@ -1021,6 +1021,23 @@ def _build_argparser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser
              "float32 buffers would push RSS past the host limit.",
     )
     shared.add_argument(
+        "--dequant-cache-stride",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Bound the dequant cache to the last N layers' worth of "
+             "weights (only effective with ``--dequant-cache on``). "
+             "Default ``None`` is unbounded - all decoded weights are "
+             "held for the process lifetime. Smaller N bounds the "
+             "Python heap (e.g. ``--dequant-cache-stride 2`` keeps "
+             "only the current + next layer) at the cost of "
+             "re-dequantising evicted layers at the start of every "
+             "decode step. Useful on memory-constrained hosts where "
+             "the unbounded cache would OOM; useless on small models "
+             "where the unbounded cache already fits. The KV-cache "
+             "and matmul-path buffers are not affected by this flag.",
+    )
+    shared.add_argument(
         "--memory-trace",
         action="store_true",
         help="Print OS RSS, Python heap, mmap resident, dequant cache, "
@@ -1491,6 +1508,7 @@ def _load_model_bundle(args, parser: argparse.ArgumentParser) -> dict:
     forwarder = make_qwen2_forwarder(
         qcfg,
         enable_dequant_cache=enable_cache,
+        dequant_cache_stride=args.dequant_cache_stride,
         memory_trace=args.memory_trace,
         last_index=final_layer_index,
         tokenizer=tokenizer,
@@ -1945,7 +1963,12 @@ def cmd_chat(args) -> int:
         qcfg.quant_gguf = None
         qcfg.debug_trace = args.debug
     enable_cache = args.dequant_cache == "on"
-    forwarder = make_qwen2_forwarder(qcfg, enable_dequant_cache=enable_cache, memory_trace=args.memory_trace)
+    forwarder = make_qwen2_forwarder(
+        qcfg,
+        enable_dequant_cache=enable_cache,
+        dequant_cache_stride=args.dequant_cache_stride,
+        memory_trace=args.memory_trace,
+    )
 
     # 4. Stream one prompt + max_new tokens.
     scheduler = loaded.runtime.build_scheduler(

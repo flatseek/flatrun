@@ -27,6 +27,7 @@ What it does NOT do:
 
 from __future__ import annotations
 
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Sequence
@@ -56,6 +57,145 @@ class _NoopSection:
 
     def __exit__(self, *exc_info: object) -> None:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Dequant cache with sliding-window eviction
+# ---------------------------------------------------------------------------
+#
+# The forwarder's dequant cache holds F32 copies of quantised
+# weights so the second-and-later decode steps don't redo the
+# dequant work. The default behaviour (``stride=None``) is to
+# cache everything for the process lifetime, which on 14 B+ models
+# adds enough F32 heap to OOM memory-constrained hosts.
+#
+# ``_SlidingDequantCache`` keeps a bounded set of layer-indexed
+# weights in a sliding window: any layer more than ``stride``
+# indices behind the current decoder position is evicted. Pre/
+# post-layer tensors (``model.embed_tokens``, ``model.norm``,
+# ``lm_head``, ``language_model.*``-prefixed variants) are not
+# subject to layer rotation because they're small and reused on
+# every step.
+#
+# Caveat for the streaming model: when ``stride`` is finite the
+# cache covers at most N consecutive layers, but the decoder
+# visits layers sequentially (0, 1, 2, ...) once per step. The
+# sliding window therefore helps only when the decoder
+# revisits a layer within the same forward pass (prefill with
+# multi-token batches, prefetch-based loops). For the standard
+# single-token-per-step autoregressive path the cross-step
+# reuse benefit of the unbounded cache is lost - we re-dequant
+# every layer at the start of every step. Choose ``stride``
+# based on memory budget, accepting that smaller strides mean
+# more repeated dequant work.
+
+
+_LAYER_KEY_RE = re.compile(r"layers\.(\d+)\.")
+
+
+class _SlidingDequantCache:
+    """A dequant cache that evicts by layer-rotation.
+
+    Duck-types a dict so existing code (``cache[key] = arr``,
+    ``key in cache``, ``cache[key]``, ``cache.values()``) works
+    unchanged. The new piece is :meth:`enter_layer`, which the
+    forwarder must call before each decoder block.
+
+    Parameters
+    ----------
+    stride : int | None
+        How many layers' weights to keep resident. ``None`` (the
+        default) means unbounded - eviction is disabled. A finite
+        stride (e.g. ``2``) evicts layer-``i`` weights as soon as
+        the decoder enters layer ``i + stride``.
+    """
+
+    def __init__(self, stride: int | None = None) -> None:
+        self._cache: dict[str, np.ndarray] = {}
+        self._stride = stride
+        self._current_layer: int | None = None
+
+    @staticmethod
+    def _layer_of(key: str) -> int | None:
+        """Parse the layer index from a tensor name.
+
+        Returns ``None`` for tensors that aren't tied to a layer
+        (``model.embed_tokens.weight``, ``model.norm.weight``,
+        ``lm_head.weight``, ``language_model.<post-layer>``, ...).
+        Such tensors are not subject to layer-rotation eviction
+        because they're small and used on every step.
+        """
+        m = _LAYER_KEY_RE.search(key)
+        if m is not None:
+            return int(m.group(1))
+        return None
+
+    def enter_layer(self, layer_idx: int) -> None:
+        """Call before processing ``layer_idx``.
+
+        Evicts cached layer-``L`` weights for every ``L < layer_idx -
+        stride + 1``. With ``stride = 2`` and ``layer_idx = 5``,
+        layers 0..3 are dropped; layers 4 and 5 stay. With
+        ``stride = None`` the call is a no-op (unbounded cache).
+        """
+        self._current_layer = layer_idx
+        if self._stride is None:
+            return
+        min_keep = layer_idx - self._stride + 1
+        if min_keep <= 0:
+            return
+        # Build the list of evict keys up front; mutating the dict
+        # while iterating it is undefined behaviour. The cached
+        # arrays are big - releasing the dict entry as soon as
+        # possible lets the interpreter drop the reference and
+        # the F32 buffer can be reclaimed on the next GC cycle.
+        evict = [
+            k for k in self._cache
+            if ((l := self._layer_of(k)) is not None and l < min_keep)
+        ]
+        for k in evict:
+            self._cache.pop(k, None)
+
+    # Dict interface --------------------------------------------------------
+
+    def __setitem__(self, key: str, value: np.ndarray) -> None:
+        self._cache[key] = value
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        return self._cache[key]
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._cache
+
+    def get(self, key: str, default: np.ndarray | None = None) -> np.ndarray | None:
+        return self._cache.get(key, default)
+
+    def values(self):
+        return self._cache.values()
+
+    def keys(self):
+        return self._cache.keys()
+
+    def items(self):
+        return self._cache.items()
+
+    def __iter__(self):
+        return iter(self._cache)
+
+    def __len__(self) -> int:
+        return len(self._cache)
+
+    def clear(self) -> None:
+        self._cache.clear()
+
+    def total_bytes(self) -> int:
+        """Sum of ``ndarray.nbytes`` for every cached array.
+
+        Used by the CLI's ``--memory-trace`` print to report how
+        much of the resident set is the dequant cache. Returns 0
+        when the cache is empty.
+        """
+        return sum(int(arr.nbytes) for arr in self._cache.values())
 
 
 def _safe_int(value: object) -> int | None:
@@ -545,6 +685,7 @@ def make_qwen2_forwarder(
     *,
     dtype: str = "float32",
     enable_dequant_cache: bool = True,
+    dequant_cache_stride: int | None = None,
     memory_trace: bool = False,
     last_index: int | None = None,
     tokenizer: object | None = None,
@@ -584,12 +725,23 @@ def make_qwen2_forwarder(
     first. When ``False`` every layer's weights are dequantized
     fresh and released as soon as the layer returns — the Python
     heap stays nearly constant and the runtime operates on one
-    layer at a time. The cache is bounded only by the number of
-    distinct tensors the forwarder touches; on a 0.6 B Q4_K model
-    the resident F32 buffers add ~1.5 GB, on a 14 B model ~7 GB.
-    Pass ``enable_dequant_cache=False`` on memory-constrained
-    hosts or large models where the cache would push RSS past the
-    limit.
+    layer at a time.
+
+    ``dequant_cache_stride`` (default ``None``) bounds the cache
+    to the last ``stride`` layers' worth of weights. ``None`` is
+    the unbounded default (every decoded weight held for the
+    process lifetime - fast but can OOM on 14 B+ models where the
+    F32 footprint is ~7 GB / 30 GB). A finite stride (e.g. ``2``
+    for "current + next", ``1`` for "current only") bounds
+    memory but trades it for re-dequant work: at the start of
+    every autoregressive decode step the cache is too cold to
+    hold the next layer's weight, so the sliding window provides
+    no cross-step benefit. The stride is most useful when the
+    caller combines it with a prefetch hook that warms the
+    next layer's tensors, or with multi-token batch decode.
+    Pre/post-layer tensors (embedding, norm, lm_head) are not
+    subject to eviction regardless of ``stride`` because they're
+    small and reused on every step.
 
     ``memory_trace`` (default ``False``) prints per-layer memory
     diagnostics to stderr - useful for verifying streaming mode
@@ -785,7 +937,19 @@ def make_qwen2_forwarder(
     # Python variables that the garbage collector frees when the
     # decoder block returns. ``dequant_cache`` stays ``None`` so
     # the cache lookup path is a single ``is None`` check.
-    dequant_cache: dict[str, np.ndarray] | None = {} if enable_dequant_cache else None
+    #
+    # When enabled, ``dequant_cache`` is a ``_SlidingDequantCache``
+    # that duck-types a dict and additionally supports
+    # ``enter_layer(idx)`` to drop layer-indexed keys that fall
+    # outside the configured sliding window. The pre/post-layer
+    # bookend tensors (embedding, norm, lm_head) don't carry a
+    # ``layers.N.`` token, so they're auto-immune to eviction.
+    if enable_dequant_cache:
+        dequant_cache: dict[str, np.ndarray] | _SlidingDequantCache = (
+            _SlidingDequantCache(stride=dequant_cache_stride)
+        )
+    else:
+        dequant_cache = None
 
     cos_cache, sin_cache = _precompute_rope(
         head_dim=head_dim,
@@ -1123,6 +1287,15 @@ def make_qwen2_forwarder(
         """One decoder block: attn (RoPE + causal) -> MLP, both residual."""
         seq_len = hidden.shape[0]
 
+        # Notify the dequant cache that we're about to enter a new
+        # layer. With ``stride=None`` the call is a no-op; with a
+        # finite stride it drops any cached weights that fell out
+        # of the sliding window (e.g. stride=2 entering layer 5
+        # evicts layers 0..3). The cost is a single dict scan plus
+        # a possible dict.pop per evicted key.
+        if dequant_cache is not None:
+            dequant_cache.enter_layer(idx)
+
         # Profiler hooks: gate every operation behind a ``section``
         # context manager. The context manager is a no-op for the
         # common case (no profiler attached) so the overhead is only
@@ -1366,6 +1539,8 @@ def make_qwen2_forwarder(
           older ``post_attention_layernorm`` is not referenced by the
           decoder block in HF ``Gemma3TextDecoderLayer``.
         """
+        if dequant_cache is not None:
+            dequant_cache.enter_layer(idx)
         seq_len = hidden.shape[0]
         attn_scale = config.query_pre_attn_scalar or head_dim
 
@@ -1515,6 +1690,8 @@ def make_qwen2_forwarder(
         the safer default - the model would produce correctly-shaped
         but un-modulated attention output, not garbage.
         """
+        if dequant_cache is not None:
+            dequant_cache.enter_layer(idx)
         seq_len = hidden.shape[0]
         residual = hidden
         attn_norm_w = handles[

@@ -18,6 +18,7 @@ import pytest
 from flatrun.core.tensor import BufferTensorHandle
 from flatrun.model.qwen2 import (
     Qwen2Config,
+    _SlidingDequantCache,
     _apply_rope,
     _precompute_rope,
     make_qwen2_forwarder,
@@ -334,6 +335,110 @@ def test_qwen2_projection_matmul_does_not_astype_copy() -> None:
     for n, original in snapshots.items():
         current = handles[n].as_numpy()
         assert current.dtype == np.float32
+
+
+def test_sliding_dequant_cache_keeps_dict_interface() -> None:
+    """``_SlidingDequantCache`` duck-types a dict so the existing
+    ``cache[k] = arr`` / ``k in cache`` / ``cache.values()`` / ``len``
+    call sites in the forwarder don't need to change.
+    """
+    cache = _SlidingDequantCache(stride=4)
+    a = np.zeros((1,), dtype=np.float32)
+    b = np.ones((1,), dtype=np.float32)
+    cache["model.layers.0.mlp.gate_proj.weight"] = a
+    cache["model.norm.weight"] = b
+
+    assert "model.layers.0.mlp.gate_proj.weight" in cache
+    assert cache["model.norm.weight"] is b
+    assert cache.get("does.not.exist") is None
+    assert cache.get("does.not.exist", default=b) is b
+    assert len(cache) == 2
+    assert set(cache.keys()) == {
+        "model.layers.0.mlp.gate_proj.weight",
+        "model.norm.weight",
+    }
+    assert list(cache) == list(cache.keys())
+
+
+def test_sliding_dequant_cache_unbounded_keeps_everything() -> None:
+    """``stride=None`` (the default) is effectively unbounded.
+
+    ``enter_layer(idx)`` is a no-op. Keys of every layer index
+    survive every advance.
+    """
+    cache = _SlidingDequantCache()  # stride=None default
+    for i in range(8):
+        cache[f"model.layers.{i}.mlp.gate_proj.weight"] = np.zeros(
+            (1,), dtype=np.float32
+        )
+    for i in range(8):
+        cache.enter_layer(i)
+        assert len(cache) == 8  # nothing ever evicted
+
+
+def test_sliding_dequant_cache_evicts_by_layer() -> None:
+    """Finite stride drops layer-``L`` keys once ``L`` falls out
+    of the sliding window. Pre/post-layer tensors (no ``layers.N.``
+    token) are immune to eviction.
+    """
+    cache = _SlidingDequantCache(stride=2)
+    for i in range(6):
+        cache[f"model.layers.{i}.mlp.gate_proj.weight"] = np.zeros(
+            (1,), dtype=np.float32
+        )
+    # Global / non-layer tensors - kept forever. The
+    # ``language_model.model.layers.0.*`` form is *not* global
+    # (the regex picks out the inner ``layers.0.`` token) so it
+    # counts toward the 6 layered keys.
+    cache["model.norm.weight"] = np.zeros((1,), dtype=np.float32)
+    cache["lm_head.weight"] = np.zeros((1,), dtype=np.float32)
+    cache["model.embed_tokens.weight"] = np.zeros((1,), dtype=np.float32)
+
+    # Layer 0 entry: window keeps >= -1, drop nothing. 9 keys.
+    cache.enter_layer(0)
+    assert len(cache) == 9
+
+    # Layer 1: keep 0..1. Still 9 keys (none in < 0 are evicted).
+    cache.enter_layer(1)
+    assert len(cache) == 9
+
+    # Layer 2: keep >= 1. Layer 0 evicted. 8 keys.
+    cache.enter_layer(2)
+    assert "model.layers.0.mlp.gate_proj.weight" not in cache
+    assert "model.layers.1.mlp.gate_proj.weight" in cache
+    assert "model.layers.2.mlp.gate_proj.weight" in cache
+    assert "model.norm.weight" in cache
+    assert "lm_head.weight" in cache
+    assert "model.embed_tokens.weight" in cache
+    assert len(cache) == 8
+
+
+def test_sliding_dequant_cache_never_evicts_negatives() -> None:
+    """Early layers (negative ``min_keep``) never evict: every cached
+    layer is >= 0 > negative bound.
+    """
+    cache = _SlidingDequantCache(stride=4)
+    for i in range(3):
+        cache[f"model.layers.{i}.mlp.gate_proj.weight"] = np.zeros(
+            (1,), dtype=np.float32
+        )
+    cache.enter_layer(1)
+    cache.enter_layer(2)
+    cache.enter_layer(3)
+    assert len(cache) == 3
+
+
+def test_sliding_dequant_cache_total_bytes() -> None:
+    """``total_bytes()`` is the sum of cached array nbytes; zero
+    when the cache is empty.
+    """
+    empty = _SlidingDequantCache()
+    assert empty.total_bytes() == 0
+
+    cache = _SlidingDequantCache(stride=4)
+    cache["a.weight"] = np.zeros((100,), dtype=np.float32)  # 400 bytes
+    cache["b.weight"] = np.ones((50,), dtype=np.float32)    # 200 bytes
+    assert cache.total_bytes() == 600
 
 
 # ---------------------------------------------------------------------------
