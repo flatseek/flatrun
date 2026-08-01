@@ -36,3 +36,5 @@ CLAUDE.MD
 # Local config / runtime
 .env
 *.log
+SmolLM2-135M-Instruct-Q4_K_M.gguf
+src/flatrun/tests/.cache/
