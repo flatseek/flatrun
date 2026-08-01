@@ -53,6 +53,49 @@ versions follow [Semantic Versioning](https://semver.org/).
   tradeoff: ~1.5 GB extra heap for 0.6B, ~7 GB for 14B. Pass
   `--dequant-cache off` to opt back into pure streaming mode
   on memory-constrained hosts or large models.
+- **`--dequant-cache-stride N`** bounds the dequant cache to
+  the last N layers' worth of weights. Default ``None`` is
+  unbounded (every decoded weight held for the process
+  lifetime - current behaviour). Smaller N bounds Python
+  heap (e.g. ``--dequant-cache-stride 2`` keeps current +
+  next layer) at the cost of re-dequantising evicted layers
+  at the start of every decode step. Useful on memory-
+  constrained hosts where the unbounded cache would OOM.
+
+### Performance findings
+
+The detailed profiler confirmed the suspicion that the largest
+specific cost in the forward pass is the **QKV / MLP concat +
+astype** pattern: per layer, the forwarder allocates ~360 MB
+(qkv) and ~740 MB (gateup) via `np.concatenate` + `.astype(
+np.float32)`, even when the matmul itself is the same size.
+The second-largest cost is the **autoregressive decode loop**
+which re-encodes the entire prompt per step. See
+`docs/performance-review.md` for the full analysis.
+
+### Performance fixes (2026-08-01)
+
+- **Redundant `.astype(np.float32)` calls removed from the
+  projection matmul hot path** (`qwen2.py:1160`, `1256`,
+  `1289`, `~1287`, `1391`, `1445`, `1469`, `1473`, `1537`,
+  `1601`, `1626`, `1630`, plus `_compute_layer_logits`).
+  Each `astype` defaults to `copy=True` and was allocating a
+  fresh F32 buffer per decoder block even though the weights
+  were already F32. On Qwen3-14B Q4_K_M the gate_w astype
+  alone measured ~107 ms per call (370 MB memcpy).
+  Synthetic benchmark on the 14B projection path: per-layer
+  projection work dropped 270 ms -> 65 ms (4.16x).
+  End-to-end on Qwen3-0.6B Q4_K_M: top-4 projection time
+  10.77 s -> 7.53 s (a ~30 % reduction).
+- **`_SlidingDequantCache` + `enter_layer(idx)` eviction**
+  for the dequant cache. Pre/post-layer tensors (embedding,
+  norm, lm_head) are auto-immune; layer-indexed weights
+  (parsed from `model.layers.N.` or
+  `language_model.model.layers.N.` keys) evict as soon as the
+  forwarder enters `N + stride` layers past them.
+- **`_finish` `copy=False`** in `dequant/gguf.py`. The shared
+  tail of every GGUF dequant function was paying a redundant
+  output-buffer memcpy on the production F32 path.
 
 ### Removed
 
