@@ -322,7 +322,15 @@ class GGUFBackend(StorageBackend):
                 dtype=_ggml_to_numpy_dtype(_ggml_type_name(ti.ggml_type)),
                 byte_size=ti.byte_size,
                 offset=ti.offset,
-                quantization=_ggml_type_name(ti.ggml_type),
+                # Only quantised types have a non-None ``quantization``
+                # tag. F32 / F16 are stored element-by-element so the
+                # logical shape + dtype match the byte count exactly;
+                # setting them to a quant name confuses callers (the
+                # dequant hot path treats ``None`` as the "no decoder
+                # needed" gate).
+                quantization=_ggml_type_name(ti.ggml_type)
+                if _ggml_to_numpy_dtype(_ggml_type_name(ti.ggml_type)) == "uint8"
+                else None,
             )
             self._metadata[ti.name] = meta
 

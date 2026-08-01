@@ -214,7 +214,11 @@ def test_gguf_get_metadata_shape(synthetic_gguf: Path) -> None:
     try:
         m = backend.get_metadata("model.layers.0.self_attn.q_proj.weight")
         assert m.shape == (4, 4)
-        assert m.quantization == "F32"
+        # F32 tensors are stored element-by-element so the dequant
+        # gate is ``None``; the type name reported is the dtype
+        # ("float32"), not a quant name.
+        assert m.quantization is None
+        assert m.dtype == "float32"
         assert m.byte_size == 4 * 4 * 4
         # Offset must be within the file.
         assert m.offset < synthetic_gguf.stat().st_size

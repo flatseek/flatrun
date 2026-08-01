@@ -227,6 +227,27 @@ class MmapTensorHandle(TensorHandle):
     def view(self) -> TensorView:
         if self._closed:
             raise RuntimeError(f"Handle {self.name!r} is closed")
+        # Quantised tensors (Q4_K, Q5_K, Q1_0, ...) store packed
+        # blocks whose total byte size is shorter than the logical
+        # ``shape`` would imply at ``dtype=uint8``. The ``view`` here
+        # used to ``np.ndarray(shape=self._shape, dtype=self._dtype,
+        # buffer=slice_obj)`` which only works when the dtype is
+        # plain fp16/fp32/fp8 with bytes-per-element equal to the
+        # itemsize. For a quantised tensor that path raises
+        # ``buffer is too small for requested array``. Returning a
+        # 1D ``(byte_size,)`` view of the raw bytes is the correct
+        # shape for the dequant hot path; the caller is expected to
+        # know the quant layout and reshape accordingly.
+        if self._metadata.quantization is not None:
+            raw_shape = (self.byte_size,)
+            arr = np.ndarray(
+                shape=raw_shape,
+                dtype=self._dtype,
+                buffer=self._mmap[self._offset : self._offset + self.byte_size],
+                order="C",
+            )
+            arr.flags.writeable = False
+            return TensorView(data=arr, shape=raw_shape, dtype=self._metadata.dtype)
         # The mmap object's slice produces a zero-copy view.
         slice_obj = self._mmap[self._offset : self._offset + self.byte_size]
         arr = np.ndarray(
