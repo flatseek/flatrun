@@ -43,6 +43,14 @@ auto-bumps the cap to one tensor's worth and emits a
 be refusing to load the model, which is not the spirit of
 "RAM-agnostic streaming".
 
+When a handle *does* close (either from eviction or from
+`MemoryManager.clear()`), the underlying mmap region is
+returned to the OS via `madvise(MADV_DONTNEED)` for tensors
+>= 1 MiB. Without this hint, the page cache would keep the
+touched mmap pages resident long after the model has moved
+on to the next layer — RSS would grow with each layer
+touched even though the cache cap is honoured.
+
 ## Per-step memory
 
 At any point during a step, the resident set is bounded by:

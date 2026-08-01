@@ -952,6 +952,22 @@ def _build_argparser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser
         help="Print per-step timing breakdown for the first N generation steps.",
     )
     shared.add_argument(
+        "--profile-detailed",
+        action="store_true",
+        help="Print per-layer microsecond breakdown of every forward-"
+             "pass operation (RMSNorm, QKV projection, QK matmul, "
+             "softmax, AV matmul, MLP, ...). Use this to find the "
+             "real performance bottleneck in the forward pass.",
+    )
+    shared.add_argument(
+        "--profile-save",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Write the detailed profiler result to PATH as JSON. "
+             "Implies --profile-detailed.",
+    )
+    shared.add_argument(
         "--debug",
         action="store_true",
         help="Print per-layer hidden-state norms and position-collapse "
@@ -1461,6 +1477,14 @@ def _load_model_bundle(args, parser: argparse.ArgumentParser) -> dict:
         from flatrun.utils.debug import PredictionAnalyzer
         analyzer = PredictionAnalyzer(layer_count=len(selected_layers))
 
+    # The detailed profiler is opt-in: passing ``None`` makes the
+    # forwarder's _p helper return a no-op context manager so the
+    # hot path has zero overhead.
+    profiler = None
+    if args.profile_detailed or args.profile_save is not None:
+        from flatrun.utils.profiler import Profiler
+        profiler = Profiler()
+
     forwarder = make_qwen2_forwarder(
         qcfg,
         enable_dequant_cache=enable_cache,
@@ -1471,6 +1495,7 @@ def _load_model_bundle(args, parser: argparse.ArgumentParser) -> dict:
         exclude_token_ids=exclude_token_ids,
         analyzer=analyzer,
         manager=scheduler.manager,
+        profiler=profiler,
     )
     executor = StreamingExecutor(scheduler, forwarder, kv_cache=KVCache(capacity=4096))
 
@@ -1483,6 +1508,7 @@ def _load_model_bundle(args, parser: argparse.ArgumentParser) -> dict:
         "executor": executor,
         "qcfg": qcfg,
         "analyzer": analyzer,
+        "profiler": profiler,
     }
 
 
@@ -1631,6 +1657,7 @@ def cmd_run(args) -> int:
             print(f"  id={tid:6d} logit={logits[-1, tid]:8.2f}  text={tokenizer.decode([tid])!r}")
 
     _finalize_analyzer(bundle, args)
+    _finalize_profiler(bundle, args)
     bundle["loaded"].runtime.close()
     print("Done.")
     return 0
@@ -1644,16 +1671,33 @@ def _finalize_analyzer(bundle: dict, args) -> None:
     this is a no-op in that case.
     """
     analyzer = bundle.get("analyzer")
-    if analyzer is None:
+    if analyzer is not None:
+        # Freeze so the autoregressive decode loop's repeated forwards
+        # don't accumulate stats (the trigger is the existence of the
+        # analyzer; the first forward pass has already populated it).
+        analyzer.freeze()
+        analyzer.summarize()
+        if args.debug_save_analysis is not None:
+            path = analyzer.save(args.debug_save_analysis)
+            print(f"Layer analysis saved to {path}")
+
+
+def _finalize_profiler(bundle: dict, args) -> None:
+    """Print the per-layer profiler breakdown and persist JSON.
+
+    Called from the bottom of ``cmd_run`` and ``cmd_chat``. The
+    profiler is None when ``--profile-detailed`` / ``--profile-save``
+    was not requested, so this is a no-op in that case.
+    """
+    profiler = bundle.get("profiler")
+    if profiler is None:
         return
-    # Freeze so the autoregressive decode loop's repeated forwards
-    # don't accumulate stats (the trigger is the existence of the
-    # analyzer; the first forward pass has already populated it).
-    analyzer.freeze()
-    analyzer.summarize()
-    if args.debug_save_analysis is not None:
-        path = analyzer.save(args.debug_save_analysis)
-        print(f"Layer analysis saved to {path}")
+    profiler.freeze()
+    profiler.print_per_layer()
+    profiler.print_summary()
+    if args.profile_save is not None:
+        path = profiler.save(args.profile_save)
+        print(f"Profiler result saved to {path}")
 
 
 def cmd_chat(args) -> int:
@@ -1767,6 +1811,7 @@ def cmd_chat(args) -> int:
         messages.append({"role": "assistant", "content": reply_text})
 
     _finalize_analyzer(bundle, args)
+    _finalize_profiler(bundle, args)
     bundle["loaded"].runtime.close()
     return 0
 

@@ -53,6 +53,16 @@ Native dtypes supported: `F32`, `F16`, `BF16`. Quantised
 shards (MLX 4-bit, etc.) are exposed as `uint8` bytes; the
 dequant module turns them back into floats at fetch time.
 
+When a tensor handle closes (for example after the runtime
+has run the layer that uses it), the underlying mmap region
+is returned to the OS via `madvise(MADV_DONTNEED)` for
+tensors >= 1 MiB. Without this hint, the page cache would
+keep the touched pages resident long after the model has
+moved on to the next layer — RSS would grow with each layer
+touched even though the cache cap is honoured. This is
+particularly important for streamed inference on
+memory-constrained hosts.
+
 ## GGUF
 
 `GGUFBackend` reads GGUF v3 metadata and the tensor info table

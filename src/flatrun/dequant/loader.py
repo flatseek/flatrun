@@ -10,7 +10,7 @@ the patterns real model files use:
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Union
 
 import numpy as np
 
@@ -40,15 +40,30 @@ _GGUF_DECODERS = {
 }
 
 
+# Raw byte input accepted by the GGUF decoders. Accepting either
+# ``bytes`` (the historic API) or a ``np.uint8`` ndarray (a zero-copy
+# view into the mmap) lets ``dequant_handle`` skip the explicit
+# ``handle.materialize()`` copy that was the largest fixed cost of
+# the dequant hot path on 14B+ models.
+RawBytes = Union[bytes, "np.ndarray"]
+
+
 def dequant_handle(handle: TensorHandle, dtype: str = "float16") -> np.ndarray:
     """Dequantize a single tensor handle.
 
     The handle's :attr:`metadata.quantization` selects the decoder. When
     the metadata has no quantization tag (``None``) the function falls
     back to ``handle.as_numpy()`` and casts to ``dtype``.
+
+    The decoder is handed the *view* returned by ``handle.as_numpy()``,
+    not the bytes that ``handle.materialize()`` would copy. The
+    materialise path was previously the largest single cost in the
+    dequant hot path: a 50+ MB ``bytes`` allocation per decoder
+    call (eight per layer per pass ⇒ ≅ 14 GB of avoidable
+    allocations on a 14B model). The view is zero-copy and the
+    decoders accept either form.
     """
     q = handle.metadata.quantization
-    raw = handle.materialize()
     if q is None:
         arr = handle.as_numpy()
         if arr.dtype != np.dtype(dtype):
@@ -69,6 +84,7 @@ def dequant_handle(handle: TensorHandle, dtype: str = "float16") -> np.ndarray:
             f"Re-quantize with `llama-quantize` against the upstream "
             f"build to a supported type (Q4_K_M, Q5_K_M, Q6_K, Q8_0)."
         )
+    raw = handle.as_numpy()  # zero-copy view into the mmap
     return decoder(raw, handle.metadata.shape, np.dtype(dtype))
 
 

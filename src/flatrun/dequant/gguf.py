@@ -26,6 +26,21 @@ from __future__ import annotations
 import numpy as np
 
 
+def _as_uint8(raw: "bytes | np.ndarray") -> np.ndarray:
+    """Wrap a raw byte buffer as a contiguous uint8 ndarray view.
+
+    Both ``bytes`` (the legacy API) and ``np.ndarray`` (zero-copy
+    view into the mmap, the new fast path) are accepted. Internal
+    callers always receive a uid8 ndarray they can ``reshape`` into
+    the per-block layout.
+    """
+    if isinstance(raw, np.ndarray):
+        if raw.dtype == np.uint8:
+            return raw
+        return raw.astype(np.uint8)
+    return np.frombuffer(raw, dtype=np.uint8)
+
+
 # GGUF is little-endian on the wire regardless of host byte order.
 _F16_LE = np.dtype("<f2")
 
@@ -53,7 +68,7 @@ def _finish(decoded: np.ndarray, size: int, shape, dtype) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-def dequant_q4_0(raw: bytes, shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+def dequant_q4_0(raw: bytes | np.ndarray, shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
     """Decode a ``Q4_0`` tensor.
 
     Block layout (18 bytes per 32 elements)::
@@ -73,7 +88,7 @@ def dequant_q4_0(raw: bytes, shape: tuple[int, ...], dtype: np.dtype) -> np.ndar
     if size == 0:
         return np.empty(0, dtype=dtype).reshape(shape)
     n_blocks = (size + 31) // 32
-    raw_arr = np.frombuffer(raw, dtype=np.uint8).reshape(n_blocks, 18)
+    raw_arr = _as_uint8(raw).reshape(n_blocks, 18)
     d = _fp16(raw_arr, 0)
     qs = raw_arr[:, 2:]
 
@@ -84,7 +99,7 @@ def dequant_q4_0(raw: bytes, shape: tuple[int, ...], dtype: np.dtype) -> np.ndar
     return _finish(decoded, size, shape, dtype)
 
 
-def dequant_q8_0(raw: bytes, shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+def dequant_q8_0(raw: bytes | np.ndarray, shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
     """Decode a ``Q8_0`` tensor.
 
     Block layout (34 bytes per 32 elements)::
@@ -96,7 +111,7 @@ def dequant_q8_0(raw: bytes, shape: tuple[int, ...], dtype: np.dtype) -> np.ndar
     if size == 0:
         return np.empty(0, dtype=dtype).reshape(shape)
     n_blocks = (size + 31) // 32
-    raw_arr = np.frombuffer(raw, dtype=np.uint8).reshape(n_blocks, 34)
+    raw_arr = _as_uint8(raw).reshape(n_blocks, 34)
     d = _fp16(raw_arr, 0)
     qs = raw_arr[:, 2:].view(np.int8).astype(np.float32)
     return _finish(qs * d[:, None], size, shape, dtype)
@@ -158,7 +173,7 @@ def dequant_q4_k(raw: bytes, shape: tuple[int, ...], dtype: np.dtype) -> np.ndar
     if size == 0:
         return np.empty(0, dtype=dtype).reshape(shape)
     n_blocks = (size + QK_K - 1) // QK_K
-    raw_arr = np.frombuffer(raw, dtype=np.uint8).reshape(n_blocks, 144)
+    raw_arr = _as_uint8(raw).reshape(n_blocks, 144)
 
     d = _fp16(raw_arr, 0)[:, None]
     dmin = _fp16(raw_arr, 2)[:, None]
@@ -200,7 +215,7 @@ def dequant_q5_k(raw: bytes, shape: tuple[int, ...], dtype: np.dtype) -> np.ndar
     if size == 0:
         return np.empty(0, dtype=dtype).reshape(shape)
     n_blocks = (size + QK_K - 1) // QK_K
-    raw_arr = np.frombuffer(raw, dtype=np.uint8).reshape(n_blocks, 176)
+    raw_arr = _as_uint8(raw).reshape(n_blocks, 176)
 
     d = _fp16(raw_arr, 0)[:, None]
     dmin = _fp16(raw_arr, 2)[:, None]
@@ -223,7 +238,7 @@ def dequant_q5_k(raw: bytes, shape: tuple[int, ...], dtype: np.dtype) -> np.ndar
     return _finish(decoded, size, shape, dtype)
 
 
-def dequant_q1_0(raw: bytes, shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+def dequant_q1_0(raw: bytes | np.ndarray, shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
     """Decode a ``Q1_0`` (Bonsai 1-bit) tensor.
 
     Block layout (18 bytes per 128 elements)::
@@ -246,7 +261,7 @@ def dequant_q1_0(raw: bytes, shape: tuple[int, ...], dtype: np.dtype) -> np.ndar
         return np.empty(0, dtype=dtype).reshape(shape)
     block_elems = 128
     n_blocks = -(-size // block_elems)  # ceil division; tail bits stay zero
-    raw_arr = np.frombuffer(raw, dtype=np.uint8).reshape(n_blocks, 18)
+    raw_arr = _as_uint8(raw).reshape(n_blocks, 18)
     d = _fp16(raw_arr, 0)
     qs = raw_arr[:, 2:18]
     # ``np.unpackbits`` is MSB-first within each byte; the reference C
@@ -259,7 +274,7 @@ def dequant_q1_0(raw: bytes, shape: tuple[int, ...], dtype: np.dtype) -> np.ndar
     return _finish(decoded, size, shape, dtype)
 
 
-def dequant_q5_0(raw: bytes, shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+def dequant_q5_0(raw: bytes | np.ndarray, shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
     """Decode a ``Q5_0`` tensor.
 
     Block layout (22 bytes per 32 elements)::
@@ -272,7 +287,7 @@ def dequant_q5_0(raw: bytes, shape: tuple[int, ...], dtype: np.dtype) -> np.ndar
     if size == 0:
         return np.empty(0, dtype=dtype).reshape(shape)
     n_blocks = (size + 31) // 32
-    raw_arr = np.frombuffer(raw, dtype=np.uint8).reshape(n_blocks, 22)
+    raw_arr = _as_uint8(raw).reshape(n_blocks, 22)
     d = _fp16(raw_arr, 0)
     qh = raw_arr[:, 2:6].copy().view(np.uint32).reshape(-1)
     qs = raw_arr[:, 6:22]
@@ -290,7 +305,7 @@ def dequant_q5_0(raw: bytes, shape: tuple[int, ...], dtype: np.dtype) -> np.ndar
     return _finish(decoded, size, shape, dtype)
 
 
-def dequant_q5_1(raw: bytes, shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+def dequant_q5_1(raw: bytes | np.ndarray, shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
     """Decode a ``Q5_1`` tensor.
 
     Block layout (24 bytes per 32 elements)::
@@ -304,7 +319,7 @@ def dequant_q5_1(raw: bytes, shape: tuple[int, ...], dtype: np.dtype) -> np.ndar
     if size == 0:
         return np.empty(0, dtype=dtype).reshape(shape)
     n_blocks = (size + 31) // 32
-    raw_arr = np.frombuffer(raw, dtype=np.uint8).reshape(n_blocks, 24)
+    raw_arr = _as_uint8(raw).reshape(n_blocks, 24)
     d = _fp16(raw_arr, 0)[:, None]
     m = _fp16(raw_arr, 2)[:, None]
     qh = raw_arr[:, 4:8].copy().view(np.uint32).reshape(-1)
@@ -347,7 +362,7 @@ def dequant_q6_k(raw: bytes, shape: tuple[int, ...], dtype: np.dtype) -> np.ndar
     if size == 0:
         return np.empty(0, dtype=dtype).reshape(shape)
     n_blocks = (size + QK_K - 1) // QK_K
-    raw_arr = np.frombuffer(raw, dtype=np.uint8).reshape(n_blocks, 210)
+    raw_arr = _as_uint8(raw).reshape(n_blocks, 210)
 
     ql_all = raw_arr[:, 0:128]
     qh_all = raw_arr[:, 128:192]

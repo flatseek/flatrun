@@ -23,6 +23,14 @@ The probe feeds `MemoryManager.peak_rss`, which the
 benchmark uses to validate the "constant RAM regardless of
 model size" promise.
 
+When a handle closes (via `MmapTensorHandle.close`), the
+underlying mmap region is hinted back to the OS through
+`madvise(MADV_DONTNEED)` for tensors >= 1 MiB. The hint
+asks the kernel to drop the pages from the page cache so the
+RAM can be reused for the next layer. On Windows (where
+`madvise` doesn't exist) this is a no-op; the layers still
+fit, the OS just keeps the pages around.
+
 ## LayerScheduler
 
 `flatrun.runtime.scheduler.LayerScheduler` is the per-step
@@ -41,6 +49,18 @@ The scheduler is intentionally a single iteration per
 overlap, and no batched layers - keeping it sequential makes
 peak RAM strictly bounded by one layer's worth of mmap'd
 windows plus whatever the forwarder is holding transiently.
+
+The scheduler exposes its `manager` via a read-only property
+so the forwarder can load the post-layer tensors (final
+norm + LM head) at every layer when the prediction-evolution
+analyzer is enabled. Without this, only the last selected
+layer would have access to those tensors.
+
+Layer selection (`--max-layers N`, `--layers LIST`) is
+honoured at this layer: the scheduler flags the first
+selected layer with `LayerHandles.is_first` and the last
+with `LayerHandles.is_last`, so the forwarder knows when to
+embed tokens and when to apply the final norm + LM head.
 
 ## KVCache
 

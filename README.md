@@ -40,29 +40,60 @@ on a 16 GB laptop - at the cost of slower inference.
 
 - **Streaming runtime** (`flatrun.runtime`): mmap-based weight access,
   layer scheduler with LRU eviction, per-layer KV cache, custom
-  memory manager with byte cap.
+  memory manager with byte cap. On Linux/macOS, mmap'd tensors
+  larger than 1 MiB are released back to the OS via
+  `madvise(MADV_DONTNEED)` when the layer closes, so RSS stays
+  bounded by the per-layer working set rather than the cumulative
+  touched-mmap.
 - **Storage backends** (`flatrun.backend`):
   - `SafeTensorBackend` - hand-written parser, no third-party deps.
   - `GGUFBackend` - parses GGUF v3 in pure Python, including
     on-disk dequantisation for the common block types.
   - `MultiBackend` - composite backend for sharded checkpoints.
 - **Reference forwarder** (`flatrun.model.qwen2`): pure NumPy
-  Qwen2 / Llama / Qwen3 decoder with the architectural features
-  that matter for accuracy:
+  Qwen2 / Llama / Qwen3 / Qwen3.5 / Gemma 3 decoder with:
   - per-head RMSNorm on Q and K (Qwen3)
   - half-split (NEOX) and consecutive-pair (NORM) RoPE, picked
     automatically from the GGUF architecture
   - tied or untied LM head
   - grouped-query attention
   - bfloat16, float16, and float32 weight dtypes
+- **Layer selection** (`--max-layers N`, `--layers LIST`): run a
+  truncated-depth copy of the model (`--max-layers`) or a custom
+  subset of decoder layers in any order with inclusive ranges
+  (`--layers 0-6,19-24,34-39`). The scheduler attaches the
+  embedding to the first selected layer and the final norm + LM
+  head to the last selected layer so the subset is a
+  self-contained forward pass. Useful for adaptive inference and
+  selective-layer-execution research.
+- **Per-token debug table** (`--debug`): per-layer stats for
+  every token — norm, delta, stable, influence, entropy,
+  confidence, rank_by_norm, rank_delta, rank_stable. Special
+  tokens are filtered out by default (`--debug-include-special`
+  to show them).
+- **Prediction Evolution analyzer** (`--debug`): runs the final
+  norm + LM head at every layer and tracks the next-token
+  prediction. Post-inference summary covers per-layer table,
+  confidence growth, most influential layers (top-k by
+  `delta_confidence`), prediction changes, prediction stabilization
+  layer, and a suggested early exit (top1 stable + confidence ≥
+  95% of final + entropy/margin within tolerance). JSON via
+  `--debug-save-analysis PATH`.
+- **Detailed profiler** (`--profile-detailed`): microsecond
+  breakdown of every forward-pass operation (RMSNorm, QKV
+  projection, QK matmul, softmax, AV matmul, MLP, ...) per
+  layer, plus a percentage summary by category. JSON via
+  `--profile-save PATH`. The accompanying
+  [performance review](docs/performance-review.md) walks through
+  the actual bottlenecks the profiling revealed.
 - **GGUF dequant** (`flatrun.dequant`): Q1_0, Q4_0, Q5_0, Q5_1,
   Q4_K, Q5_K, Q6_K, Q8_0. All K-quants are vectorised transcriptions
   of the matching `dequantize_row_q*` in
   [llama.cpp ggml-quants.c](https://github.com/ggerganov/llama.cpp/blob/master/ggml/src/ggml-quants.c).
 - **BPE tokenizer** (`flatrun.tokenizer`): byte-level BPE that
   accepts a HuggingFace `tokenizer.json` (with `vocab.json` +
-  `merges.txt` fallback) and reads the embedded vocab + merges from a
-  GGUF's `tokenizer.ggml.*` block.
+  `merges.txt` fallback) and reads the embedded vocab + merges from
+  a GGUF's `tokenizer.ggml.*` block.
 - **CLI** (`python -m flatrun.cli`): single entry point that
   auto-detects GGUF / SafeTensors / MLX-4bit, applies the model's
   chat template, and runs greedy or sampled generation.
@@ -83,10 +114,11 @@ runs correctly today.
 | Qwen2 / Qwen2.5 | GGUF | ✅ | uses NEOX RoPE, bf16 / fp16 / fp32 |
 | Qwen2.5-Coder | both | ✅ | identical to Qwen2.5 |
 | Qwen3 | both | ✅ | per-head `q_norm` / `k_norm` applied |
+| Qwen3.5 (full attention layers) | GGUF | ✅ | output gate supported when weight present |
+| Qwen3.5 (linear / DeltaNet layers) | GGUF | ⚠️ | raises clear error; not implemented |
 | SmolLM2 | both | ✅ | Llama-arch with GQA |
+| Gemma 3 | MLX | ✅ | per-MLP RMSNorm, gated attention, qk-norm gain |
 | **Bonsai (PrismML 1-bit)** | GGUF Q1_0 | ✅ | 1.125 bpw, custom ggml type id 41 |
-| Qwen3.5 / Qwen3.5-MoE | MLX | ❌ | hybrid linear + full attention (DeltaNet) |
-| Gemma 3 | MLX | ❌ | per-MLP RMSNorm, gated attention, qk-norm gain |
 | Phi-3 / Gemma 2 / Mistral | — | ❌ | not yet wired |
 
 The model matrix we test against lives in
@@ -229,6 +261,23 @@ Generation:
 
 Diagnostics:
   --profile                print per-step timing breakdown
+  --profile-detailed       per-layer microsecond breakdown of every
+                           forward-pass operation; aggregates to
+                           category-level percentages at the end
+  --profile-save PATH      persist the detailed profiler result (JSON);
+                           implies --profile-detailed
+  --debug                  per-token debug table per layer +
+                           Prediction Evolution summary
+  --debug-include-special  show special tokens in the per-token table
+  --debug-max-token-rows N max tokens shown per layer (default 16)
+  --debug-save-analysis PATH  persist the Layer Analysis Summary (JSON);
+                              implies --debug
+  --memory-trace           per-layer RSS / Python heap / KV / Dequant
+                           / hidden size
+  --compare-layer REF_JSON cross-check per-layer hidden stats vs LM
+                           Studio / llama.cpp output
+  --max-layers N           use only the first N decoder layers
+  --layers LIST            run a custom subset (e.g. 0-6,19-24,34-39)
 ```
 
 `run`-only options: ``--prompt TEXT``, ``--messages-json JSON``.
@@ -304,12 +353,29 @@ laptop:
 | Qwen2.5-Coder-0.5B Q8_0 | GGUF | ~640 MiB | ~25 |
 | SmolLM2-360M Q8_0 | GGUF | ~400 MiB | ~40 |
 | Qwen3-0.6B Q4_K_M | GGUF | ~512 MiB | ~12 |
+| Qwen3-14B Q4_K_M | GGUF | ~2.0 GiB | ~1.5 |
 | Bonsai-1.7B Q1_0 | GGUF | ~3 GiB | ~5 |
 
 Pure-NumPy GEMM is the bottleneck; replacing `_apply_rope`,
 `_decoder_block`, and the LM head with a BLAS or MLX kernel
 typically doubles throughput on Apple Silicon. The streaming layer
 itself (mmap, scheduler, KV cache) is not on the critical path.
+
+The detailed profiler reveals where the time actually goes in a
+single forward pass. To see the per-operation breakdown:
+
+```bash
+flatrun run --profile-detailed --profile-save profile.json \
+    --prompt "halo" --model /path/to/14B --max-new 1
+```
+
+The full review of the forward pass is in
+[`docs/performance-review.md`](docs/performance-review.md). The
+short version: the largest specific cost is the **QKV / MLP
+concat + astype** pattern (one `np.concatenate` + one
+`.astype(np.float32)` allocation per layer per projection),
+followed by the **autoregressive decode loop** that re-runs the
+entire prompt per step.
 
 ---
 
@@ -324,7 +390,12 @@ See [`docs/limitations.md`](docs/limitations.md). The short version:
 - Some chat templates fall back to a generic Qwen2 default when
   the model ships an exotic one.
 - The CLI re-encodes the whole prompt each step (full prefill),
-  not incremental decode.
+  not incremental decode. The detailed profiler makes this
+  visible (`--profile-detailed`).
+- Per-layer concat + astype allocates ~1 GB during a 14B
+  forward pass; the memory manager keeps this in check via
+  `madvise(MADV_DONTNEED)` but pure-NumPy matmul is
+  allocation-bound.
 
 ---
 

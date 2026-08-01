@@ -1,21 +1,24 @@
 # Limitations
 
-FlatRun 0.1.0 is intentionally a thin runtime over a single
+FlatRun is intentionally a thin runtime over a single
 reference forwarder. The following are out of scope or only
 partially supported.
 
 ## Architectures
 
-The reference forwarder covers the Qwen2 / Llama family plus
-Qwen3 (per-head Q/K RMSNorm) and Bonsai's Q1_0 1-bit format.
-It does not (yet) implement:
+The reference forwarder in `flatrun.model.qwen2` covers
+Qwen2 / Qwen2.5 / Qwen3 / Qwen3.5 (full attention only) /
+Llama / Gemma 3 / SmolLM2 / Bonsai (Q1_0). Each architecture
+shares the same decoder block skeleton with small variations
+(Gemma 3's `1 + weight` RMSNorm gain, Qwen3's per-head Q/K
+norm, Qwen3.5's output gate). It does not (yet) implement:
 
-- **Gemma 3** - per-MLP RMSNorm, gated attention,
-  `query_pre_attn_scalar`, and the qk-norm gain `(1 + w)`.
-  These need their own decoder block.
-- **Qwen3.5 / Qwen3.5-MoE** - hybrid linear + full attention
-  (DeltaNet), per-layer type selection, `attn_output_gate`.
-  Requires a new forwarder class.
+- **Qwen3.5 / Qwen3.5-MoE linear (DeltaNet) layers** - the
+  linear-attention path needs a recurrent state update with
+  chunked delta-rule. The full-attention path works. The
+  forwarder raises a clear `NotImplementedError` when it
+  hits a `linear_attention` layer type so the failure mode
+  is obvious.
 - **Phi-3**, **Gemma 2**, **Mistral** - the
   `flatrun.model.qwen2._decoder_block` would need a
   separate code path for each.
@@ -27,14 +30,27 @@ of supported and unsupported models.
 
 - The forwarder is pure NumPy. A 0.5 B Q8_0 model generates
   around 25 tok/s on a single thread of a modern laptop CPU.
+  A Qwen3-14B Q4_K_M streams at ~1.5 tok/s on the same
+  hardware.
 - There is no BLAS, no Metal kernel, no MLX decoder, no
   CUDA. Replacing the per-layer matmuls with a real kernel
   is the obvious optimisation path; the streaming layer
   itself is not on the critical path.
+- Per-layer QKV / MLP concat + astype allocates ~1 GB per
+  forward pass on a 14B model. The memory manager keeps
+  this bounded via `madvise(MADV_DONTNEED)` but the alloc
+  itself is wasted work. See
+  [`performance-review.md`](performance-review.md) for the
+  full breakdown.
 - The CLI re-runs the full prefill on every step instead of
   appending a single token to the KV cache. For long
   generations, an incremental `step_incremental` method
-  would help.
+  would help. The detailed profiler makes this visible
+  (`--profile-detailed`).
+- Use `--profile-detailed` to see the per-operation breakdown
+  of a forward pass. The summary aggregates by category
+  (Attention, MLP, Tensor Loading, Dequantization, Norm,
+  Sampling, Other) so the percentages tell a story.
 
 ## Tokenization
 
@@ -69,4 +85,6 @@ of supported and unsupported models.
   does at load time. The runtime doesn't split a single
   layer across devices.
 - No metrics export. The CLI prints timing to stderr but
-  doesn't speak OpenTelemetry, Prometheus, etc.
+  doesn't speak OpenTelemetry, Prometheus, etc. Use
+  `--profile-save PATH` to dump the profiler result as
+  JSON and pipe to your own collector.

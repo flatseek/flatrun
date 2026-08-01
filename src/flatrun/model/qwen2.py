@@ -27,6 +27,7 @@ What it does NOT do:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
@@ -38,6 +39,23 @@ from ..runtime.kv_cache import KVCache
 from ..runtime.scheduler import LayerHandles
 from ..utils.debug import per_token_metrics, print_per_token_table
 from ..utils.types import LayerDescriptor
+
+
+class _NoopSection:
+    """A zero-overhead context manager used when no profiler is attached.
+
+    The forwarder wraps every operation in a ``with _p(name, p):``
+    block. When ``p`` is ``None`` (the common case), ``_p`` returns
+    this class so the runtime cost is a single ``__enter__`` /
+    ``__exit__`` pair per operation with no Python-level work — the
+    methods are no-ops.
+    """
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
 
 
 def _safe_int(value: object) -> int | None:
@@ -534,6 +552,7 @@ def make_qwen2_forwarder(
     exclude_token_ids: set[int] | None = None,
     analyzer: object | None = None,
     manager: object | None = None,
+    profiler: object | None = None,
 ) -> Callable[[LayerDescriptor, LayerHandles, KVCache], np.ndarray]:
     """Return a ``ForwardFn`` that runs a Qwen2 / Llama forward pass.
 
@@ -618,6 +637,17 @@ def make_qwen2_forwarder(
     forwarder uses the manager to load these tensors on demand
     so every layer can produce a prediction. When ``analyzer``
     is ``None`` the manager is not consulted.
+
+    ``profiler`` (default ``None``) is an optional
+    :class:`flatrun.utils.profiler.Profiler` instance. When
+    supplied, every operation in the decoder block is bracketed
+    with ``profiler.section("name")`` so the per-layer breakdown
+    and SUMMARY can be printed at the end of inference. The
+    profiler is zero-cost when ``None`` — the ``section``
+    context manager is a no-op when the profiler is frozen and
+    the forwarder only calls it when one is passed. The CLI
+    wires it up automatically when ``--profile-detailed`` is
+    set.
     """
     np_dtype = np.dtype(dtype)
     head_dim = config.head_dim or (config.hidden_size // config.num_attention_heads)
@@ -644,6 +674,20 @@ def make_qwen2_forwarder(
     # handle objects can be closed by the manager.
     _norm_w_cache: np.ndarray | None = None
     _head_w_cache: np.ndarray | None = None
+
+    def _p(name: str, prof: object | None):
+        """Return a section context manager or a no-op.
+
+        Wrapping every operation in ``with _p("name", profiler): ...``
+        keeps the call sites compact. When ``profiler`` is ``None``
+        the helper returns a context manager that does nothing —
+        no ``time.perf_counter`` call, no list append, just a
+        stub. The forwarder is therefore zero-cost when no
+        profiler is attached.
+        """
+        if prof is None:
+            return _NoopSection()
+        return prof.section(name)
 
     def _compute_layer_logits(
         h: np.ndarray,
@@ -1054,37 +1098,51 @@ def make_qwen2_forwarder(
         """One decoder block: attn (RoPE + causal) -> MLP, both residual."""
         seq_len = hidden.shape[0]
 
-        # ----- Attention -----
-        attn_norm_w = handles[
-            f"model.layers.{idx}.input_layernorm.weight"
-        ].as_numpy().astype(np.float32)
-        residual = hidden
-        x = _rms_norm(hidden, attn_norm_w, config.rms_norm_eps)
+        # Profiler hooks: gate every operation behind a ``section``
+        # context manager. The context manager is a no-op for the
+        # common case (no profiler attached) so the overhead is only
+        # the cost of one attribute lookup per operation.
+        _P = profiler
+        if _P is not None:
+            _P.begin_layer(idx)
 
-        q_w, q_b = _fetch_linear_with_quant(
-            handles, idx, "self_attn.q_proj", config, np_dtype, dequant_cache=dequant_cache
-        )
-        k_w, k_b = _fetch_linear_with_quant(
-            handles, idx, "self_attn.k_proj", config, np_dtype, dequant_cache=dequant_cache
-        )
-        v_w, v_b = _fetch_linear_with_quant(
-            handles, idx, "self_attn.v_proj", config, np_dtype, dequant_cache=dequant_cache
-        )
+        # ----- Attention -----
+        with _p("load_tensors", _P):
+            attn_norm_w = handles[
+                f"model.layers.{idx}.input_layernorm.weight"
+            ].as_numpy().astype(np.float32)
+        residual = hidden
+        with _p("rms_norm_attn", _P):
+            x = _rms_norm(hidden, attn_norm_w, config.rms_norm_eps)
+
+        with _p("dequant_q", _P):
+            q_w, q_b = _fetch_linear_with_quant(
+                handles, idx, "self_attn.q_proj", config, np_dtype, dequant_cache=dequant_cache
+            )
+        with _p("dequant_k", _P):
+            k_w, k_b = _fetch_linear_with_quant(
+                handles, idx, "self_attn.k_proj", config, np_dtype, dequant_cache=dequant_cache
+            )
+        with _p("dequant_v", _P):
+            v_w, v_b = _fetch_linear_with_quant(
+                handles, idx, "self_attn.v_proj", config, np_dtype, dequant_cache=dequant_cache
+            )
         # Canonical (out, in); one matmul for all three projections.
         q_w = _as_linear(q_w, config.hidden_size, f"layer{idx}.q_proj")
         k_w = _as_linear(k_w, config.hidden_size, f"layer{idx}.k_proj")
         v_w = _as_linear(v_w, config.hidden_size, f"layer{idx}.v_proj")
-        qkv_w = np.concatenate([q_w, k_w, v_w], axis=0).astype(np.float32)
-        qkv = x @ qkv_w.T
-        if q_b is not None or k_b is not None or v_b is not None:
-            qkv = qkv + np.concatenate(
-                [
-                    q_b if q_b is not None else np.zeros(q_w.shape[0], np.float32),
-                    k_b if k_b is not None else np.zeros(k_w.shape[0], np.float32),
-                    v_b if v_b is not None else np.zeros(v_w.shape[0], np.float32),
-                ],
-                axis=0,
-            )
+        with _p("qkv_proj", _P):
+            qkv_w = np.concatenate([q_w, k_w, v_w], axis=0).astype(np.float32)
+            qkv = x @ qkv_w.T
+            if q_b is not None or k_b is not None or v_b is not None:
+                qkv = qkv + np.concatenate(
+                    [
+                        q_b if q_b is not None else np.zeros(q_w.shape[0], np.float32),
+                        k_b if k_b is not None else np.zeros(k_w.shape[0], np.float32),
+                        v_b if v_b is not None else np.zeros(v_w.shape[0], np.float32),
+                    ],
+                    axis=0,
+                )
 
         q = qkv[:, :q_dim].reshape(seq_len, n_heads, head_dim)
         k = qkv[:, q_dim : q_dim + kv_dim].reshape(seq_len, n_kv_heads, head_dim)
@@ -1092,7 +1150,8 @@ def make_qwen2_forwarder(
 
         # Rotate at the *absolute* position, which continues any cached
         # prefix instead of restarting at zero.
-        past = kv.stack(idx)
+        with _p("kv_stack", _P):
+            past = kv.stack(idx)
         past_len = 0 if past is None else int(past[0].shape[0])
         positions = np.arange(past_len, past_len + seq_len)
 
@@ -1120,71 +1179,101 @@ def make_qwen2_forwarder(
                     f"layer {idx}: q_norm/k_norm must come as a pair; "
                     f"got q={q_norm_w is not None} k={k_norm_w is not None}"
                 )
-            q = _rms_norm(q, q_norm_w.as_numpy().astype(np.float32), config.rms_norm_eps)
-            k = _rms_norm(k, k_norm_w.as_numpy().astype(np.float32), config.rms_norm_eps)
+            with _p("q_norm", _P):
+                q = _rms_norm(q, q_norm_w.as_numpy().astype(np.float32), config.rms_norm_eps)
+            with _p("k_norm", _P):
+                k = _rms_norm(k, k_norm_w.as_numpy().astype(np.float32), config.rms_norm_eps)
 
-        q = _apply_rope(q, cos_cache, sin_cache, positions,
-                        interleaved=config.rope_interleaved)
-        k = _apply_rope(k, cos_cache, sin_cache, positions,
-                        interleaved=config.rope_interleaved)
+        with _p("rope", _P):
+            q = _apply_rope(q, cos_cache, sin_cache, positions,
+                            interleaved=config.rope_interleaved)
+            k = _apply_rope(k, cos_cache, sin_cache, positions,
+                            interleaved=config.rope_interleaved)
 
-        for pos in range(seq_len):
-            kv.append(idx, k[pos], v[pos])
-        k_hist, v_hist = kv.stack(idx)
+        with _p("kv_append", _P):
+            for pos in range(seq_len):
+                kv.append(idx, k[pos], v[pos])
+        if _P is not None:
+            # Re-stack so the post-append history is available for
+            # the attention matmul. The previous ``kv_stack`` already
+            # ran above (before RoPE), so this is a second stack.
+            # Including both in the profile makes the cost visible.
+            pass
+        with _p("kv_stack", _P):
+            k_hist, v_hist = kv.stack(idx)
 
         # GQA: replicate each KV head across its query group. repeat (not
         # tile) is what pairs head h with kv head h // head_group.
-        k_full = np.repeat(k_hist, head_group, axis=1)
-        v_full = np.repeat(v_hist, head_group, axis=1)
+        with _p("gqa_repeat", _P):
+            k_full = np.repeat(k_hist, head_group, axis=1)
+            v_full = np.repeat(v_hist, head_group, axis=1)
 
         scale = 1.0 / np.sqrt(head_dim)
-        attn = np.einsum("thd,Thd->htT", q, k_full) * scale
-        attn = attn + _causal_mask(seq_len, past_len)
+        with _p("qk_matmul", _P):
+            attn = np.einsum("thd,Thd->htT", q, k_full) * scale
+        with _p("causal_mask", _P):
+            attn = attn + _causal_mask(seq_len, past_len)
         if config.attn_logit_softcap is not None:
             cap = float(config.attn_logit_softcap)
             attn = np.tanh(attn / cap) * cap
-        attn = _softmax(attn, axis=-1)
-        context = np.einsum("htT,Thd->thd", attn, v_full)
+        with _p("softmax", _P):
+            attn = _softmax(attn, axis=-1)
+        with _p("av_matmul", _P):
+            context = np.einsum("htT,Thd->thd", attn, v_full)
         attn_out = context.reshape(seq_len, q_dim)
 
-        o_w, o_b = _fetch_linear_with_quant(
-            handles, idx, "self_attn.o_proj", config, np_dtype, dequant_cache=dequant_cache
-        )
+        with _p("dequant_o", _P):
+            o_w, o_b = _fetch_linear_with_quant(
+                handles, idx, "self_attn.o_proj", config, np_dtype, dequant_cache=dequant_cache
+            )
         o_w = _as_linear(o_w, q_dim, f"layer{idx}.o_proj")
-        attn_out = attn_out @ o_w.astype(np.float32).T
-        if o_b is not None:
-            attn_out = attn_out + o_b
-        hidden = residual + attn_out
+        with _p("o_proj", _P):
+            attn_out = attn_out @ o_w.astype(np.float32).T
+            if o_b is not None:
+                attn_out = attn_out + o_b
+        with _p("residual_attn", _P):
+            hidden = residual + attn_out
 
         # ----- MLP (SwiGLU) -----
-        mlp_norm_w = handles[
-            f"model.layers.{idx}.post_attention_layernorm.weight"
-        ].as_numpy().astype(np.float32)
+        with _p("load_tensors", _P):
+            mlp_norm_w = handles[
+                f"model.layers.{idx}.post_attention_layernorm.weight"
+            ].as_numpy().astype(np.float32)
         residual = hidden
-        x = _rms_norm(hidden, mlp_norm_w, config.rms_norm_eps)
+        with _p("rms_norm_mlp", _P):
+            x = _rms_norm(hidden, mlp_norm_w, config.rms_norm_eps)
 
-        gate_w, _ = _fetch_linear_with_quant(
-            handles, idx, "mlp.gate_proj", config, np_dtype, dequant_cache=dequant_cache
-        )
-        up_w, _ = _fetch_linear_with_quant(
-            handles, idx, "mlp.up_proj", config, np_dtype, dequant_cache=dequant_cache
-        )
-        down_w, _ = _fetch_linear_with_quant(
-            handles, idx, "mlp.down_proj", config, np_dtype, dequant_cache=dequant_cache
-        )
+        with _p("dequant_gate", _P):
+            gate_w, _ = _fetch_linear_with_quant(
+                handles, idx, "mlp.gate_proj", config, np_dtype, dequant_cache=dequant_cache
+            )
+        with _p("dequant_up", _P):
+            up_w, _ = _fetch_linear_with_quant(
+                handles, idx, "mlp.up_proj", config, np_dtype, dequant_cache=dequant_cache
+            )
+        with _p("dequant_down", _P):
+            down_w, _ = _fetch_linear_with_quant(
+                handles, idx, "mlp.down_proj", config, np_dtype, dequant_cache=dequant_cache
+            )
         gate_w = _as_linear(gate_w, config.hidden_size, f"layer{idx}.gate_proj")
         up_w = _as_linear(up_w, config.hidden_size, f"layer{idx}.up_proj")
         inter = gate_w.shape[0]
         down_w = _as_linear(down_w, inter, f"layer{idx}.down_proj")
 
-        gateup = x @ np.concatenate([gate_w, up_w], axis=0).astype(np.float32).T
+        with _p("gateup_proj", _P):
+            gateup = x @ np.concatenate([gate_w, up_w], axis=0).astype(np.float32).T
         gate = gateup[:, :inter]
         up = gateup[:, inter:]
-        # SiLU(gate) * up. Clip guards exp() from overflowing to inf on
-        # the rare large-magnitude activation.
-        silu_gate = gate / (1.0 + np.exp(-np.clip(gate, -80.0, 80.0)))
-        mlp_out = (silu_gate * up) @ down_w.astype(np.float32).T
-        out = residual + mlp_out
+        with _p("silu", _P):
+            # SiLU(gate) * up. Clip guards exp() from overflowing to inf on
+            # the rare large-magnitude activation.
+            silu_gate = gate / (1.0 + np.exp(-np.clip(gate, -80.0, 80.0)))
+        with _p("mul", _P):
+            silu_mul = silu_gate * up
+        with _p("down_proj", _P):
+            mlp_out = silu_mul @ down_w.astype(np.float32).T
+        with _p("residual_mlp", _P):
+            out = residual + mlp_out
         # Release every per-layer weight and intermediate so the
         # Python heap does not retain the previous layer once the
         # next one starts. ``del`` is the only way to be sure the
@@ -1193,7 +1282,7 @@ def make_qwen2_forwarder(
         del (
             q_w, k_w, v_w, qkv_w, qkv, q, k, v,
             q_norm_w, k_norm_w, gate_w, up_w, down_w,
-            gateup, gate, up, silu_gate, mlp_out, x,
+            gateup, gate, up, silu_gate, silu_mul, mlp_out, x,
             attn_out, o_w, residual, attn_norm_w, mlp_norm_w,
         )
         if config.quant_mlx_4bit or dequant_cache is None:
@@ -1202,6 +1291,8 @@ def make_qwen2_forwarder(
             # the cache is None; meaningful when the cache is on.
             import gc as _gc
             _gc.collect()
+        if _P is not None:
+            _P.end_layer()
         return out
 
     def _gemma3_decoder_block(

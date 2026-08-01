@@ -38,15 +38,18 @@ flatrun/
 ├── model/                  # Model-aware glue
 │   ├── manifest.py         # Layer grouping
 │   ├── huggingface.py      # HF checkpoint loader
-│   └── qwen2.py            # Reference Qwen2 / Llama / Qwen3 forwarder
+│   └── qwen2.py            # Reference Qwen2 / Llama / Qwen3 / Qwen3.5 /
+│                          # Gemma 3 forwarder
 ├── dequant/                # GGUF dequantisation (pure NumPy)
 │   ├── gguf.py             # Q1_0, Q4_0, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K, Q8_0
 │   ├── mlx.py              # MLX 4-bit (weight / scales / biases triples)
 │   └── loader.py           # Decoder dispatch + tensor-handle hookup
 ├── tokenizer/              # Byte-level BPE
 │   └── bpe.py              # HuggingFace tokenizer.json + GGUF metadata
-├── utils/                  # Shared types, errors, memory probe
-├── tests/                  # 102 unit + integration tests
+├── utils/                  # Shared types, errors, debug, profiler
+│   ├── debug.py            # per-token metrics table + PredictionAnalyzer
+│   └── profiler.py         # --profile-detailed instrumentation
+├── tests/                  # unit + integration tests
 └── docs/                   # This directory
 ```
 
@@ -93,6 +96,12 @@ instead treats the model file as a virtual-memory backing store:
   tensors are accessed as zero-copy `np.ndarray` views into the
   file (or into a freshly `munmap`'d dequant buffer for
   quantised types).
+- When a tensor handle closes, the runtime calls
+  `madvise(MADV_DONTNEED)` on the corresponding mmap region
+  (for tensors >= 1 MiB). On Linux/macOS this drops the
+  pages from the page cache so the OS can reclaim the RAM
+  for other tensors. The cumulative touched-mmap no longer
+  inflates RSS.
 
 The result is that the resident set stays bounded by the
 configured cache cap (default 256 MiB) plus the KV cache, no
