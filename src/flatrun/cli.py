@@ -55,6 +55,7 @@ from flatrun import (
 from flatrun.model.qwen2 import Qwen2Config, make_qwen2_forwarder
 from flatrun.model.sampling import Sampler
 from flatrun.runtime.memory import MemoryConfig
+from flatrun.runtime.backend import get_backend
 from flatrun.tokenizer import auto_load
 from flatrun.utils.errors import ConfigurationError
 
@@ -990,6 +991,17 @@ def _build_argparser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser
              "Implies --profile-detailed.",
     )
     shared.add_argument(
+        "--backend",
+        type=str,
+        choices=["python", "native"],
+        default="python",
+        help="Select the projection backend. 'python' uses the pure "
+             "NumPy dequant-and-matmul path (default). 'native' uses "
+             "the optional C++/NEON fused Q4_K kernel from the "
+             "flatrun_native package when available; falls back to "
+             "'python' with a warning if the extension is not loaded.",
+    )
+    shared.add_argument(
         "--debug",
         action="store_true",
         help="Print per-layer hidden-state norms and position-collapse "
@@ -1527,6 +1539,13 @@ def _load_model_bundle(args, parser: argparse.ArgumentParser) -> dict:
         from flatrun.utils.profiler import Profiler
         profiler = Profiler()
 
+    backend = get_backend(args.backend)
+    if args.backend == "native" and not backend.available:
+        print(
+            f"WARNING: --backend native requested but the flatrun_native "
+            f"C++ extension is unavailable; falling back to python.",
+            file=sys.stderr,
+        )
     forwarder = make_qwen2_forwarder(
         qcfg,
         enable_dequant_cache=enable_cache,
@@ -1539,6 +1558,7 @@ def _load_model_bundle(args, parser: argparse.ArgumentParser) -> dict:
         analyzer=analyzer,
         manager=scheduler.manager,
         profiler=profiler,
+        backend=backend,
     )
     executor = StreamingExecutor(scheduler, forwarder, kv_cache=KVCache(capacity=4096))
 

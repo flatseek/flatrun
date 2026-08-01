@@ -18,6 +18,9 @@ htmlcov/
 venv/
 env/
 ENV/
+.claude
+CLAUDE.MD
+
 
 # Editor / OS
 .DS_Store

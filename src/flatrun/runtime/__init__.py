@@ -7,6 +7,12 @@ from ..core.tensor import (
     TensorHandle,
     TensorView,
 )
+from .backend import (
+    BackendBase,
+    NativeBackend,
+    PythonBackend,
+    get_backend,
+)
 from .executor import (
     ForwardFn,
     ModelExecutor,
@@ -25,6 +31,7 @@ from .scheduler import (
 )
 
 __all__ = [
+    "BackendBase",
     "BufferTensorHandle",
     "ComputeFn",
     "ForwardFn",
@@ -37,7 +44,9 @@ __all__ = [
     "MemoryManager",
     "MmapTensorHandle",
     "ModelExecutor",
+    "NativeBackend",
     "PrefetchFn",
+    "PythonBackend",
     "RuntimeConfig",
     "RuntimeStats",
     "SchedulerStats",
@@ -45,4 +54,5 @@ __all__ = [
     "TensorHandle",
     "TensorView",
     "TokenStep",
+    "get_backend",
 ]

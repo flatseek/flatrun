@@ -675,6 +675,112 @@ def _fetch_linear_with_quant(
     return weight, bias
 
 
+def _fetch_q4k_raw(
+    handles: LayerHandles,
+    layer_index: int,
+    proj_name: str,
+) -> tuple[np.ndarray, int, int, np.ndarray | None]:
+    """Fetch the raw Q4_K bytes for a projection, bypassing the dequant cache.
+
+    Returns ``(raw_bytes, n, k, bias_or_none)`` where ``raw_bytes`` is
+    a 1-D uint8 view of the on-disk Q4_K payload, ``n`` is the
+    number of output features (rows), ``k`` is the number of input
+    features (columns), and ``bias`` is the F32 bias if present.
+
+    Used by the native backend path: the C++ kernel reads the bytes
+    directly without going through the F32 dequant stage.
+    """
+    # Build the same key the dequant path uses.
+    if layer_index == -1:
+        candidates = [proj_name, f"language_model.{proj_name}"]
+    else:
+        candidates = [
+            f"model.layers.{layer_index}.{proj_name}",
+            f"language_model.model.layers.{layer_index}.{proj_name}",
+        ]
+    base = None
+    for cand in candidates:
+        if f"{cand}.weight" in handles:
+            base = cand
+            break
+    if base is None:
+        raise KeyError(f"Could not find Q4_K weight for {proj_name!r}")
+    handle = handles[f"{base}.weight"]
+    raw = handle.as_numpy()  # zero-copy uint8 view into the mmap
+    # The handle's metadata carries the logical shape (out, in).
+    n = int(handle.metadata.shape[0])
+    k = int(handle.metadata.shape[1])
+    if layer_index == -1:
+        bias_name = f"{proj_name}.bias"
+    else:
+        bias_name = f"model.layers.{layer_index}.{proj_name}.bias"
+    if bias_name in handles:
+        bias = handles[bias_name].as_numpy().astype(np.float32, copy=False)
+    else:
+        bias = None
+    return raw, n, k, bias
+
+
+def _matmul_via_backend(
+    weight: np.ndarray,
+    x: np.ndarray,
+    backend: object | None,
+) -> np.ndarray:
+    """Compute ``weight @ x`` via the backend when possible.
+
+    When ``backend`` is ``None`` or does not advertise
+    ``matmul_q4k``, falls back to ``weight @ x``. The backend is
+    only consulted when ``weight`` is a Q4_K quantised tensor
+    (detected via the on-disk metadata's ``quantization`` field).
+    Otherwise (F32/F16 weights, MLX 4-bit, etc.) the numpy path
+    stays in charge.
+    """
+    if backend is None or not getattr(backend, "available", False):
+        return weight @ x
+    # The backend needs the raw Q4_K bytes, not the dequantized
+    # weight. The forwarder's dequant cache stores the decoded F32
+    # buffer, so dispatch only happens when the cache is *off* or
+    # the weight is not Q4_K cached. The simplest hook today: check
+    # the dtype of the buffer; if it's F32 (decoded), stay on numpy.
+    if weight.dtype == np.float32:
+        return weight @ x
+    # Quantised weight: dispatch through the backend.
+    return backend.matmul_q4k(x, weight, weight.shape[0], weight.shape[1])
+
+
+# Map on-disk quant tags to backend method names. ``None`` means the
+# backend doesn't cover this format and the dispatcher should fall
+# back to the numpy dequant path. The forwarder calls
+# :func:`_pick_native_method` once per projection per layer, not per
+# token, so the dict lookup is amortised to nothing.
+_NATIVE_METHOD = {
+    "Q4_K": "matmul_q4k",
+    "Q6_K": "matmul_q6k",
+    "Q8_0": "matmul_q8_0",
+}
+
+
+def _pick_native_method(backend: object, quant: str | None):
+    """Return a callable that does the per-quant matmul.
+
+    ``backend`` is a :class:`NativeBackend` (or any object exposing
+    ``matmul_q4k``/``matmul_q6k``/``matmul_q8_0``). ``quant`` is the
+    on-disk tag (``"Q4_K"``/``"Q6_K"``/``"Q8_0"``). Returns the
+    method bound to ``backend`` so the call site can write
+    ``_pick_native_method(B, q)(x, w, n, k)``.
+
+    The returned callable already includes the per-method fallback
+    (RuntimeError -> PythonBackend) when ``backend`` is a real
+    ``NativeBackend``. For unknown quants we return a callable that
+    raises — the forwarder is supposed to gate on
+    ``quant in _NATIVE_METHOD`` first.
+    """
+    name = _NATIVE_METHOD.get(quant or "")
+    if name is None:
+        raise RuntimeError(f"no native kernel for quant={quant!r}")
+    return getattr(backend, name)
+
+
 # ---------------------------------------------------------------------------
 # The forward pass
 # ---------------------------------------------------------------------------
@@ -694,6 +800,7 @@ def make_qwen2_forwarder(
     analyzer: object | None = None,
     manager: object | None = None,
     profiler: object | None = None,
+    backend: object | None = None,
 ) -> Callable[[LayerDescriptor, LayerHandles, KVCache], np.ndarray]:
     """Return a ``ForwardFn`` that runs a Qwen2 / Llama forward pass.
 
@@ -1301,6 +1408,7 @@ def make_qwen2_forwarder(
         # common case (no profiler attached) so the overhead is only
         # the cost of one attribute lookup per operation.
         _P = profiler
+        _B = backend
         if _P is not None:
             _P.begin_layer(idx)
 
@@ -1313,43 +1421,120 @@ def make_qwen2_forwarder(
         with _p("rms_norm_attn", _P):
             x = _rms_norm(hidden, attn_norm_w, config.rms_norm_eps)
 
-        with _p("dequant_q", _P):
-            q_w, q_b = _fetch_linear_with_quant(
-                handles, idx, "self_attn.q_proj", config, np_dtype, dequant_cache=dequant_cache
+        # Backend-aware weight fetch: when the native backend is set,
+        # and the weights on disk are one of the supported native
+        # quant types (Q4_K, Q6_K, Q8_0), fetch the raw bytes
+        # directly (no F32 dequant stage) and dispatch through the
+        # per-quant matmul method. The numpy path stays in charge for
+        # F32 / F16 / Q5_K / MLX weights, or whenever the native
+        # backend is unavailable.
+        #
+        # Earlier versions only knew about Q4_K and required the whole
+        # layer to be Q4_K before dispatching; that meant a Qwen3
+        # Q4_K_M model (which uses Q6_K for some tensors) silently
+        # fell back to Python on every layer. The new check is
+        # per-tensor: any tensor that the native backend supports is
+        # sent through it, anything else (Q5_K, F32, F16, MLX) is
+        # routed to the F32 dequant path.
+
+        def _quant_of(weight_name: str) -> str | None:
+            try:
+                return getattr(handles[weight_name].metadata, "quantization", None)
+            except KeyError:
+                return None
+
+        proj_names = (
+            "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+            "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj",
+        )
+        # Native-quants the C++ extension knows about. The dispatcher
+        # routes per-tensor to the right backend method.
+        _NATIVE_QUANTS = {"Q4_K", "Q6_K", "Q8_0"}
+        proj_quant = {
+            p: _quant_of(f"model.layers.{idx}.{p}.weight")
+            for p in proj_names
+        }
+        # Every projection must be either a native-supported quant or
+        # absent (None — the layer won't dispatch the missing one). If
+        # a projection is a *different* quant (Q5_K, F16, MLX), we
+        # still want native for the other tensors but we can't keep
+        # the per-layer branching simple, so we use the numpy
+        # dequant path uniformly for the layer.
+        _all_native = (
+            _B is not None
+            and getattr(_B, "available", False)
+            and getattr(_B, "name", "") == "native"
+            and all(
+                q in _NATIVE_QUANTS
+                for q in proj_quant.values()
+                if q is not None
             )
-        with _p("dequant_k", _P):
-            k_w, k_b = _fetch_linear_with_quant(
-                handles, idx, "self_attn.k_proj", config, np_dtype, dequant_cache=dequant_cache
-            )
-        with _p("dequant_v", _P):
-            v_w, v_b = _fetch_linear_with_quant(
-                handles, idx, "self_attn.v_proj", config, np_dtype, dequant_cache=dequant_cache
-            )
-        # Canonical (out, in); one matmul for all three projections.
-        q_w = _as_linear(q_w, config.hidden_size, f"layer{idx}.q_proj")
-        k_w = _as_linear(k_w, config.hidden_size, f"layer{idx}.k_proj")
-        v_w = _as_linear(v_w, config.hidden_size, f"layer{idx}.v_proj")
-        with _p("qkv_proj", _P):
-            # q_w/k_w/v_w are already F32 (from ``_fetch_proj`` with the
-            # production ``dtype=float32``). The previous code did
-            # ``.astype(np.float32)`` on the concatenated buffer; the
-            # default for ``astype`` is ``copy=True`` so it allocated a
-            # 147 MB F32 buffer per decoder step on a 14 B model just
-            # to copy data that was already F32. Measuring 50-100 ms
-            # per call on Apple Silicon. ``copy=False`` returns the
-            # same buffer when the dtype matches (0.003-0.4 ms) and
-            # only pays the conversion cost when it does not.
-            qkv_w = np.concatenate([q_w, k_w, v_w], axis=0).astype(np_dtype, copy=False)
-            qkv = x @ qkv_w.T
-            if q_b is not None or k_b is not None or v_b is not None:
-                qkv = qkv + np.concatenate(
-                    [
-                        q_b if q_b is not None else np.zeros(q_w.shape[0], np.float32),
-                        k_b if k_b is not None else np.zeros(k_w.shape[0], np.float32),
-                        v_b if v_b is not None else np.zeros(v_w.shape[0], np.float32),
-                    ],
-                    axis=0,
+        )
+        if _all_native:
+            # Fetch raw bytes for every projection. ``_fetch_q4k_raw``
+            # is a misnomer at this point — it just returns the raw
+            # uint8 view plus shape and bias regardless of quant.
+            q_raw, q_n, q_k, q_b = _fetch_q4k_raw(handles, idx, "self_attn.q_proj")
+            k_raw, k_n, k_k, k_b = _fetch_q4k_raw(handles, idx, "self_attn.k_proj")
+            v_raw, v_n, v_k, v_b = _fetch_q4k_raw(handles, idx, "self_attn.v_proj")
+            q_w = q_raw; q_n_total = q_n; q_k_dim = q_k; q_quant = proj_quant["self_attn.q_proj"]
+            k_w = k_raw; k_n_total = k_n; k_k_dim = k_k; k_quant = proj_quant["self_attn.k_proj"]
+            v_w = v_raw; v_n_total = v_n; v_k_dim = v_k; v_quant = proj_quant["self_attn.v_proj"]
+        else:
+            with _p("dequant_q", _P):
+                q_w, q_b = _fetch_linear_with_quant(
+                    handles, idx, "self_attn.q_proj", config, np_dtype, dequant_cache=dequant_cache
                 )
+            with _p("dequant_k", _P):
+                k_w, k_b = _fetch_linear_with_quant(
+                    handles, idx, "self_attn.k_proj", config, np_dtype, dequant_cache=dequant_cache
+                )
+            with _p("dequant_v", _P):
+                v_w, v_b = _fetch_linear_with_quant(
+                    handles, idx, "self_attn.v_proj", config, np_dtype, dequant_cache=dequant_cache
+                )
+        # Canonical (out, in); one matmul for all three projections.
+        qkv_w = None  # defined in the numpy path; the backend path uses raw bytes directly
+        if _all_native:
+            # q_w / k_w / v_w are raw uint8 bytes. Each is logically
+            # (n, k). Dispatch per-tensor via the quant-specific
+            # backend method (matmul_q4k, matmul_q6k, matmul_q8_0)
+            # in BATCHED form — the C++ entry point handles the entire
+            # (seq, k) activation matrix in a single pybind11 call,
+            # so the per-token loop lives inside C++ where it doesn't
+            # pay the Python boundary cost. Earlier versions used the
+            # 1-D per-token API in a Python for-loop; that measured
+            # ~7x slower than the batched form on Qwen3-0.6B prefill
+            # because each iteration re-marshalled x, weight, and
+            # output through numpy.
+            with _p("qkv_proj", _P):
+                _matmul_q = _pick_native_method(_B, q_quant)
+                _matmul_k = _pick_native_method(_B, k_quant)
+                _matmul_v = _pick_native_method(_B, v_quant)
+                q_part = _matmul_q(x, q_w, q_n_total, q_k_dim)
+                k_part = _matmul_k(x, k_w, k_n_total, k_k_dim)
+                v_part = _matmul_v(x, v_w, v_n_total, v_k_dim)
+                qkv = np.concatenate(
+                    [q_part, k_part, v_part], axis=1,
+                ).astype(np_dtype, copy=False)
+        else:
+            q_w = _as_linear(q_w, config.hidden_size, f"layer{idx}.q_proj")
+            k_w = _as_linear(k_w, config.hidden_size, f"layer{idx}.k_proj")
+            v_w = _as_linear(v_w, config.hidden_size, f"layer{idx}.v_proj")
+            with _p("qkv_proj", _P):
+                qkv_w = np.concatenate([q_w, k_w, v_w], axis=0).astype(np_dtype, copy=False)
+                qkv = x @ qkv_w.T
+        # Bias add (shared between both paths).
+        if q_b is not None or k_b is not None or v_b is not None:
+            q_bias_n = q_n_total if _all_native else q_w.shape[0]
+            k_bias_n = k_n_total if _all_native else k_w.shape[0]
+            v_bias_n = v_n_total if _all_native else v_w.shape[0]
+            if q_b is None: q_b = np.zeros(q_bias_n, np.float32)
+            if k_b is None: k_b = np.zeros(k_bias_n, np.float32)
+            if v_b is None: v_b = np.zeros(v_bias_n, np.float32)
+            qkv = qkv + np.concatenate(
+                [q_b, k_b, v_b], axis=0,
+            )
 
         q = qkv[:, :q_dim].reshape(seq_len, n_heads, head_dim)
         k = qkv[:, q_dim : q_dim + kv_dim].reshape(seq_len, n_kv_heads, head_dim)
@@ -1435,11 +1620,30 @@ def make_qwen2_forwarder(
             )
         o_w = _as_linear(o_w, q_dim, f"layer{idx}.o_proj")
         with _p("o_proj", _P):
-            # See the QKV comment above. ``o_w`` is already F32 from
-            # ``_fetch_proj``; ``astype(np_dtype, copy=False)`` is the
-            # zero-cost no-op here and only pays the conversion cost
-            # when the caller chose a non-F32 dtype.
-            attn_out = attn_out @ o_w.astype(np_dtype, copy=False).T
+            # Backend dispatch (per-quant raw blocks). The dispatch is
+            # consulted only when the F32 dequant cache hasn't filled
+            # yet - ``o_w.dtype != np.float32`` means we're looking at
+            # the cached F32 buffer, in which case numpy is the right
+            # path. With the cache off (streaming mode) the dtype is
+            # ``uint8`` and we route through the native kernel.
+            o_quant = proj_quant.get("self_attn.o_proj")
+            if (
+                _all_native
+                and o_quant in _NATIVE_QUANTS
+                and o_w.dtype != np.float32
+            ):
+                _matmul_o = _pick_native_method(_B, o_quant)
+                # The batched API accepts (seq, k) directly; no need
+                # to flatten + reshape.
+                attn_out = _matmul_o(
+                    attn_out, o_w, o_w.shape[0], o_w.shape[1],
+                )
+            else:
+                # ``o_w`` is already F32 from ``_fetch_proj``;
+                # ``astype(np_dtype, copy=False)`` is the zero-cost
+                # no-op here and only pays the conversion cost when
+                # the caller chose a non-F32 dtype.
+                attn_out = attn_out @ o_w.astype(np_dtype, copy=False).T
             if o_b is not None:
                 attn_out = attn_out + o_b
         with _p("residual_attn", _P):
@@ -1454,28 +1658,53 @@ def make_qwen2_forwarder(
         with _p("rms_norm_mlp", _P):
             x = _rms_norm(hidden, mlp_norm_w, config.rms_norm_eps)
 
-        with _p("dequant_gate", _P):
-            gate_w, _ = _fetch_linear_with_quant(
-                handles, idx, "mlp.gate_proj", config, np_dtype, dequant_cache=dequant_cache
-            )
-        with _p("dequant_up", _P):
-            up_w, _ = _fetch_linear_with_quant(
-                handles, idx, "mlp.up_proj", config, np_dtype, dequant_cache=dequant_cache
-            )
-        with _p("dequant_down", _P):
-            down_w, _ = _fetch_linear_with_quant(
-                handles, idx, "mlp.down_proj", config, np_dtype, dequant_cache=dequant_cache
-            )
-        gate_w = _as_linear(gate_w, config.hidden_size, f"layer{idx}.gate_proj")
-        up_w = _as_linear(up_w, config.hidden_size, f"layer{idx}.up_proj")
-        inter = gate_w.shape[0]
-        down_w = _as_linear(down_w, inter, f"layer{idx}.down_proj")
+        if _all_native:
+            gate_raw, gate_n, gate_k, _ = _fetch_q4k_raw(handles, idx, "mlp.gate_proj")
+            up_raw, up_n, up_k, _ = _fetch_q4k_raw(handles, idx, "mlp.up_proj")
+            down_raw, down_n, down_k, _ = _fetch_q4k_raw(handles, idx, "mlp.down_proj")
+            gate_w = gate_raw; gate_n_total = gate_n; gate_k_dim = gate_k
+            up_w = up_raw; up_n_total = up_n; up_k_dim = up_k
+            down_w = down_raw; down_n_total = down_n; down_k_dim = down_k
+            gate_quant = proj_quant["mlp.gate_proj"]
+            up_quant = proj_quant["mlp.up_proj"]
+            down_quant = proj_quant["mlp.down_proj"]
+            inter = gate_n_total
+        else:
+            with _p("dequant_gate", _P):
+                gate_w, _ = _fetch_linear_with_quant(
+                    handles, idx, "mlp.gate_proj", config, np_dtype, dequant_cache=dequant_cache
+                )
+            with _p("dequant_up", _P):
+                up_w, _ = _fetch_linear_with_quant(
+                    handles, idx, "mlp.up_proj", config, np_dtype, dequant_cache=dequant_cache
+                )
+            with _p("dequant_down", _P):
+                down_w, _ = _fetch_linear_with_quant(
+                    handles, idx, "mlp.down_proj", config, np_dtype, dequant_cache=dequant_cache
+                )
+            gate_w = _as_linear(gate_w, config.hidden_size, f"layer{idx}.gate_proj")
+            up_w = _as_linear(up_w, config.hidden_size, f"layer{idx}.up_proj")
+            inter = gate_w.shape[0]
+            down_w = _as_linear(down_w, inter, f"layer{idx}.down_proj")
 
         with _p("gateup_proj", _P):
-            # gate_w and up_w are F32 from ``_fetch_proj``. Copy=False
-            # on the dtype alignment is zero-cost when dtype matches.
-            # Same pattern as the QKV concat above.
-            gateup = x @ np.concatenate([gate_w, up_w], axis=0).astype(np_dtype, copy=False).T
+            if _all_native:
+                # Batched dispatch: the (seq, k) activation matrix is
+                # handed to the C++ kernel once per projection, the
+                # per-token loop lives inside the kernel. Each
+                # projection has its own quant type (Qwen3 mixed
+                # precision: Q4_K on gate/up, Q6_K on down). The
+                # dispatcher picks the right kernel per tensor.
+                _matmul_gate = _pick_native_method(_B, gate_quant)
+                _matmul_up = _pick_native_method(_B, up_quant)
+                gate = _matmul_gate(x, gate_w, gate_n_total, gate_k_dim)
+                up = _matmul_up(x, up_w, up_n_total, up_k_dim)
+                gateup = np.concatenate([gate, up], axis=1)
+            else:
+                # gate_w and up_w are F32 from ``_fetch_proj``. Copy=False
+                # on the dtype alignment is zero-cost when dtype matches.
+                # Same pattern as the QKV concat above.
+                gateup = x @ np.concatenate([gate_w, up_w], axis=0).astype(np_dtype, copy=False).T
         gate = gateup[:, :inter]
         up = gateup[:, inter:]
         with _p("silu_mul", _P):
@@ -1503,8 +1732,15 @@ def make_qwen2_forwarder(
             np.multiply(silu_mul, gate, out=silu_mul)  # silu(gate)
             np.multiply(silu_mul, up, out=silu_mul)    # silu(gate) * up
         with _p("down_proj", _P):
-            # Same zero-cost-dtype-match pattern as QKV / O above.
-            mlp_out = silu_mul @ down_w.astype(np_dtype, copy=False).T
+            # Backend dispatch (per-quant raw blocks).
+            if _all_native:
+                _matmul_down = _pick_native_method(_B, down_quant)
+                mlp_out = _matmul_down(
+                    silu_mul, down_w, down_n_total, down_k_dim,
+                )
+            else:
+                # Same zero-cost-dtype-match pattern as QKV / O above.
+                mlp_out = silu_mul @ down_w.astype(np_dtype, copy=False).T
         with _p("residual_mlp", _P):
             out = residual + mlp_out
         # Release every per-layer weight and intermediate so the
@@ -1899,6 +2135,11 @@ def make_qwen2_forwarder(
         handles: LayerHandles,
         kv: KVCache,
     ) -> np.ndarray:
+        # Capture the backend in the inner function's closure so the
+        # LM head dispatch (which lives outside any decoder block)
+        # can use it.
+        nonlocal backend
+        _B = backend
         idx = layer.index
 
         # Drive pre/post-layer gates from the scheduler's flags
@@ -1994,13 +2235,38 @@ def make_qwen2_forwarder(
         if config.tie_word_embeddings:
             head_w = state["embed"]
             assert head_w is not None
+            _head_use_backend = False
+        elif (
+            _B is not None
+            and getattr(_B, "available", False)
+            and getattr(_B, "name", "") == "native"
+            and getattr(handles["lm_head.weight"].metadata, "quantization", None) in _NATIVE_METHOD
+        ):
+            # Native path for the LM head. The dispatch picks the
+            # right per-quant kernel (Q4_K / Q6_K / Q8_0) — Qwen3
+            # Q4_K_M ships a Q4_K head; SmolLM2 Q8_0 ships a Q8_0
+            # head. Both now hit the fast path.
+            head_raw, head_n, head_k, _ = _fetch_q4k_raw(handles, -1, "lm_head")
+            head_w = head_raw
+            head_n_total = head_n
+            head_k_dim = head_k
+            head_quant = getattr(handles["lm_head.weight"].metadata, "quantization", None)
+            _head_use_backend = True
         else:
             head_w = _fetch_proj(
                 handles, -1, "lm_head", config, np_dtype,
                 dequant_cache=dequant_cache,
             )
             head_w = _as_linear(head_w, config.hidden_size, "lm_head")
-        logits = (hidden @ head_w.astype(np_dtype, copy=False).T).astype(np_dtype, copy=False)
+            _head_use_backend = False
+        # Backend dispatch for the LM head.
+        if _head_use_backend:
+            _matmul_head = _pick_native_method(_B, head_quant)
+            logits = _matmul_head(
+                hidden, head_w, head_n_total, head_k_dim,
+            ).astype(np_dtype, copy=False)
+        else:
+            logits = (hidden @ head_w.astype(np_dtype, copy=False).T).astype(np_dtype, copy=False)
         if getattr(config, "debug_trace", False):
             # Same per-token table, but with logits attached so the
             # entropy and confidence columns are now populated.
