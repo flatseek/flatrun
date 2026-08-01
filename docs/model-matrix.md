@@ -1,6 +1,6 @@
 # Model matrix
 
-This is the live set of models FlatRun has been tested against.
+This is the live set of models Flatrun has been tested against.
 Each row is the model we actually drove through the CLI in
 greedy mode (`--no-sample`) and compared to LM Studio
 (`temperature=0`, `top_k=1`, `repeat_penalty=1.0`).
@@ -8,7 +8,7 @@ greedy mode (`--no-sample`) and compared to LM Studio
 A ✅ in the *LM Studio match* column means the first 12 generated
 tokens are byte-identical to the server response. A ⚠️ means the
 output is fluent English and on-topic but diverges on later
-tokens due to numerical drift between FlatRun's float32 matmul
+tokens due to numerical drift between Flatrun's float32 matmul
 and llama.cpp's Q8_1-quantised activations.
 
 ## SafeTensors (HuggingFace layout)
@@ -64,7 +64,7 @@ couple of unit tests built around a tiny synthetic model.
 ## Known limitations
 
 Some larger models (~7B+) currently produce unstable activations
-or incorrect logits when run through FlatRun. The Qwen3-14B
+or incorrect logits when run through Flatrun. The Qwen3-14B
 debug log shows the hidden state exploding at L6 (std jumps
 from ~1.2 to ~58) — this is the active trouble zone. Models up
 to ~1B (Qwen2.5-0.5B, Qwen2.5-Coder-0.5B, Qwen3-0.6B,

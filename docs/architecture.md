@@ -1,6 +1,6 @@
 # Architecture
 
-FlatRun is a thin runtime that sits between a storage backend
+Flatrun is a thin runtime that sits between a storage backend
 (either SafeTensors or GGUF) and a user-supplied forward pass.
 Three principles drive every design decision:
 
@@ -84,7 +84,7 @@ architecture. Everything else is format-agnostic.
 ## Why per-layer, not whole-model
 
 A 70B Q4 checkpoint is ~40 GB on disk. The conventional solution
-is to load the whole thing into RAM and keep it warm. FlatRun
+is to load the whole thing into RAM and keep it warm. Flatrun
 instead treats the model file as a virtual-memory backing store:
 
 - The scheduler mmaps one decoder block at a time and the

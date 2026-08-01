@@ -1,6 +1,6 @@
 # Storage backends
 
-A `StorageBackend` is the only thing FlatRun's runtime talks to
+A `StorageBackend` is the only thing Flatrun's runtime talks to
 when it needs a tensor. Backends are registered through
 `flatrun.backend.registry.default_registry()`; the shipped
 implementations wire themselves in on first import.
@@ -85,7 +85,7 @@ all the way to the logits, just scrambled.
 
 ### Custom quants
 
-Some forks of llama.cpp add new GGML type ids. FlatRun ships
+Some forks of llama.cpp add new GGML type ids. Flatrun ships
 a small type table; if you hit `Unknown(N)` while loading a
 file, add the type to `_GGML_TYPES` in
 `flatrun.backend.gguf` and a matching decoder to

@@ -1,390 +1,395 @@
-# Performance review of the forward pass
-
-This is a critical, evidence-based review of the forward-pass path
-in `flatrun.model.qwen2`. The focus is *latency*, not accuracy. The
-review is the basis for the `--profile-detailed` instrumentation
-that ships in this release.
-
-The review reads the code top-to-bottom and identifies *real*
-bottlenecks — places where the implementation is doing more work
-than the math requires, with an estimated cost. Speculative
-"you could use BLAS" advice is kept until the end.
-
-When this review was written, the runtime went through the
-following forward pass for each layer:
-
-1. Load per-layer weights via the scheduler.
-2. RMSNorm on the residual input.
-3. `Q @ q_w.T + K @ k_w.T + V @ v_w.T` collapsed into a single
-   `X @ qkv_w.T` after concatenating the three weights.
-4. Reshape QKV to (seq, n_heads, head_dim) / (seq, n_kv_heads, head_dim).
-5. (Qwen3) RMSNorm on Q and K per head.
-6. RoPE on Q and K.
-7. Python loop over `seq_len` appending K/V to the KV cache.
-8. Re-stack the KV cache.
-9. `np.repeat` for GQA expansion.
-10. `einsum("thd,Thd->htT")` for QK matmul.
-11. `_causal_mask(seq_len, past_len)` allocated fresh.
-12. Softmax.
-13. `einsum("htT,Thd->thd")` for AV matmul.
-14. `O @ o_w.T` for the output projection.
-15. Residual add.
-16. MLP RMSNorm.
-17. `Gate @ gate_w.T + Up @ up_w.T` collapsed into `X @ gateup_w.T`.
-18. SiLU + elementwise multiply.
-19. `Down @ down_w.T`.
-20. Residual add.
-
-Each step is examined below.
-
----
-
-## 1. The QKV concatenation + astype (BIGGEST CHURN)
-
-```python
-q_w, q_b = _fetch_linear_with_quant(...)
-k_w, k_b = _fetch_linear_with_quant(...)
-v_w, v_b = _fetch_linear_with_quant(...)
-q_w = _as_linear(q_w, config.hidden_size, ...)
-k_w = _as_linear(k_w, config.hidden_size, ...)
-v_w = _as_linear(v_w, config.hidden_size, ...)
-qkv_w = np.concatenate([q_w, k_w, v_w], axis=0).astype(np.float32)
-qkv = x @ qkv_w.T
-```
-
-For a 14B Qwen3 with `hidden_size=5120`, `q_dim=8192`, `kv_dim=512`:
-
-| Buffer | Shape | Bytes (fp32) |
-|---|---|---|
-| `q_w` | (8192, 5120) | 160 MB |
-| `k_w` | (512, 5120) | 10 MB |
-| `v_w` | (512, 5120) | 10 MB |
-| `qkv_w` (concat) | (8704, 5120) | 178 MB |
-| `.astype(np.float32)` | (8704, 5120) | another 178 MB if dtype != fp32 |
-
-**Allocation cost per layer**: ~360 MB written, plus the previous
-layer's buffer torn down. Across 40 layers, that's ~14 GB of
-allocation churn per forward pass. The memory manager has to
-evict/load around this churn even though the *useful* total is
-~180 MB.
-
-The `.astype(np.float32)` is the worst part: when the dequant
-output is fp16 or bf16 (MLX-4bit, fp16 SafeTensors), NumPy must
-*allocate a new buffer* and copy every byte. The intermediate
-fp32 buffer is then held for the duration of the matmul.
-
-**Why the code is structured this way**: one fused matmul is
-faster than three sequential matmuls because of BLAS/LAPACK
-cache locality. The concat-then-matmul pays 178 MB of copy to
-save a few % of matmul time.
-
-**Estimated impact**: 12-25% of total inference time on large
-models where the concat/astype dwarfs the matmul itself.
-*Highest-impact optimisation.*
-
-**Suggested fix**: pre-allocate a single fp32 buffer that fits
-`max(q_dim + 2*kv_dim, hidden_size) * hidden_size` floats and
-copy into it. Or — for the default case where `dequant_cache` is
-*off* — keep the dequantized fp32 weights in the cache so the
-concat is over already-fp32 buffers. The biggest win is to
-have the cache default to **on** for Q4_K_M / Q4_0 models where
-the dequant cost is comparable to the matmul.
-
----
-
-## 2. The Python loop for KV cache append (`for pos in range(seq_len)`)
-
-```python
-for pos in range(seq_len):
-    kv.append(idx, k[pos], v[pos])
-```
-
-Each iteration:
-
-1. Calls `kv.append(...)` (Python call).
-2. Allocates a `KVEntry` dataclass.
-3. Calls `np.asarray(k, v)` (no-op when already an ndarray, but
-   the call itself has overhead).
-
-For `seq_len=512`, that's 512 × 2 = 1024 Python iterations per
-layer. For 40 layers that's 40,960 iterations per forward pass.
-
-**Estimated impact**: 1-3% on its own.
-**Why it matters**: the per-position allocation of `KVEntry`
-forces the cache to grow in a non-contiguous pattern; `kv.stack`
-later has to `np.stack` everything into a single contiguous
-buffer anyway.
-
-**Suggested fix**: extend the `KVCache` API to accept a whole
-`k, v` pair (`kv.extend(idx, k, v)`) and slice internally on
-`stack`. The Python loop disappears.
-
----
-
-## 3. `_causal_mask` allocated every layer
-
-```python
-attn = attn + _causal_mask(seq_len, past_len)
-```
-
-`_causal_mask` allocates a fresh `(seq_len, total)` float32 array
-filled with `-inf`, then sets the upper triangle to 0. For
-`seq_len=512` that's 1 MB per layer per forward pass. Across 40
-layers that's 40 MB of allocations that get freed immediately.
-
-**Estimated impact**: <1% on its own.
-**Why it matters**: allocation pressure and page-cache churn.
-
-**Suggested fix**: cache the masks per `(seq_len, past_len)` pair;
-or, since the mask only depends on the position-difference, use a
-broadcast trick (`attn + (positions[:, None] < positions[None, :]) *
--inf`) that avoids the temp allocation.
-
----
-
-## 4. The MLP `gateup` concatenation + astype (same as QKV)
-
-```python
-gateup = x @ np.concatenate([gate_w, up_w], axis=0).astype(np.float32).T
-```
-
-Identical pattern to the QKV case. For a 14B model with
-`intermediate=18944`:
-
-| Buffer | Shape | Bytes (fp32) |
-|---|---|---|
-| `gate_w` | (18944, 5120) | 370 MB |
-| `up_w` | (18944, 5120) | 370 MB |
-| `gateup_w` (concat) | (37888, 5120) | 740 MB |
-| `.astype(np.float32)` | (37888, 5120) | another 740 MB if dtype != fp32 |
-
-**Estimated impact**: 5-10% of total inference time. The MLP
-matmul is ~2x the size of the QKV matmul, and the concat/astype
-scales linearly.
-
-**Suggested fix**: same as QKV — pre-allocate a buffer, or use
-two separate matmuls and concatenate the *output* on the
-seq_len axis.
-
----
-
-## 5. The `np.einsum` overhead
-
-`np.einsum("thd,Thd->htT", q, k_full) * scale` has a small
-overhead relative to `np.matmul` because einsum evaluates the
-contraction abstractly and dispatches to BLAS. For tensors of
-this size the difference is negligible (<1%) but the pattern
-shows up three times per layer (QK, AV, and the contraction for
-the einsum parsing).
-
-**Estimated impact**: <1%.
-**Suggested fix**: replace with `q @ k_full.swapaxes(1, 2)` —
-the BLAS dispatch is identical but the call overhead is lower.
-
----
-
-## 6. The `.astype(np.float32)` on every load
-
-```python
-attn_norm_w = handles[name].as_numpy().astype(np.float32)
-```
-
-For bfloat16 weights (the default for HuggingFace SafeTensors),
-`.astype(np.float32)` allocates a new buffer and widens the
-elements. For float32 weights (GGUF Q8_0), the `.astype` is a
-no-op (returns self) but the call still has Python overhead.
-
-**Estimated impact**: <1% per call site. Many call sites mean
-the cumulative cost is meaningful.
-
-**Suggested fix**: check `metadata.dtype` first and skip the
-astype when already float32. Add a `_should_widen()` helper.
-
----
-
-## 7. The GQA replication `np.repeat`
-
-```python
-k_full = np.repeat(k_hist, head_group, axis=1)
-v_full = np.repeat(v_hist, head_group, axis=1)
-```
-
-`head_group` is typically 8 (Qwen3 14B has 28 query heads and 4
-KV heads). The repeat allocates an 8× larger buffer but the
-matmul cost itself is unchanged.
-
-**Estimated impact**: <0.5% (allocation only).
-**Why it matters**: the expanded KV buffer is held for the
-duration of the attention matmul.
-
-**Suggested fix**: skip the repeat and use the GQA-aware matmul
-directly. This is a kernel-level change and not worth the
-complexity for the current pure-NumPy setup.
-
----
-
-## 8. The autoregressive decode loop re-encodes the prompt
-
-```python
-for nxt in range(max_new):
-    ids = prompt_ids + generated
-    result = executor.step(tokens=ids)
-```
-
-The executor re-runs the entire prompt + generated sequence each
-step, then `kv.reset()` clears the cache for the next step. Total
-work is `O(max_new² / 2 + max_new * prompt_len)` instead of
-`O(max_new)`.
-
-For `max_new=128`, `prompt_len=500`: 128·500 + 128²/2 ≈ 72k
-tokens. Versus incremental decode: 128 tokens.
-
-**Estimated impact**: this is the largest single inefficiency
-in the codebase. For typical interactive usage (max_new=128)
-the autoregressive loop dominates end-to-end latency by an
-order of magnitude.
-
-**Suggested fix**: implement incremental decode in the
-executor. The forwarder emits `(seq_len, hidden)` outputs that
-the executor can cache; subsequent steps only process the new
-token. The KV cache already supports this; the issue is that
-`step()` resets the cache before each call.
-
-**Why this is hard**: the current forwarder applies the final
-norm + LM head at the *last* layer and returns logits for the
-whole sequence. For incremental decode we need logits for the
-*last* position only. The forwarder already returns the right
-shape; the executor just needs to slice.
-
----
-
-## 9. Memory accounting summary
-
-Per forward pass through a 14B model with `seq_len=512`:
-
-| Source | Bytes allocated | Per layer | 40 layers |
-|---|---|---|---|
-| QKV concat + astype | ~360 MB | ~360 MB | ~14 GB churn |
-| MLP gateup concat + astype | ~740 MB | ~740 MB | ~29 GB churn |
-| q/k/v/o/gate/up/down dequant | ~600 MB | ~600 MB | ~24 GB churn |
-| `np.repeat` for GQA | ~256 KB | ~256 KB | ~10 MB |
-| `_causal_mask` | ~1 MB | ~1 MB | ~40 MB |
-| KV cache stack | ~210 MB | ~210 MB | ~8 GB churn |
-| **Total non-matmul allocation** | | | **~75 GB churn** |
-
-The matmuls themselves do ~`700 GFLOPs` total per forward pass
-(roughly 2 × N_params × seq_len, scaled by the matmul
-constant). On a typical laptop CPU at 30 GFLOPs/s for fp32, the
-matmul alone takes ~25 seconds. The allocation churn is *not*
-on the critical path for throughput once the memory manager
-settles, but **it is on the critical path for memory pressure**
-on memory-constrained hosts — the cache cap has to evict
-buffers we just wrote.
-
----
-
-## 10. The `q/k/v` reshape after the matmul
-
-```python
-q = qkv[:, :q_dim].reshape(seq_len, n_heads, head_dim)
-k = qkv[:, q_dim : q_dim + kv_dim].reshape(seq_len, n_kv_heads, head_dim)
-v = qkv[:, q_dim + kv_dim :].reshape(seq_len, n_kv_heads, head_dim)
-```
-
-`qkv[:, :q_dim]` is a view. `reshape` is a view because the
-slice is contiguous (the matmul output is row-major).
-
-`qkv[:, q_dim : q_dim + kv_dim]` is **not** contiguous. The
-`reshape` to `(seq_len, n_kv_heads, head_dim)` therefore does a
-copy.
-
-**Estimated impact**: <0.5% (small allocations).
-**Suggested fix**: do the matmul with a custom output stride that
-lays out the channels as `(seq, n_kv, head_dim)` directly. Or
-split the QKV matmul into three so the K and V outputs are
-contiguous.
-
----
-
-## 11. The hidden state is never re-allocated
-
-`state["hidden"]` is updated by replacement, not in-place. The
-`del` block at the end of `_decoder_block` drops every reference
-to the previous layer's intermediates so the GC can reclaim them.
-
-**Verdict**: this is correct. The hidden state is a single
-buffer reused across layers.
-
----
-
-## 12. The KV cache growth is O(N²) over a generation
-
-`kv.stack` copies all past K/V entries into a fresh array on
-every call. For a 128-token generation this is `O(128²)` per
-layer. The cost is bounded by the cache capacity but for a
-4096-token context that's 16 MB of K+V per layer per step.
-
-**Estimated impact**: <1% on its own, but interacts with the
-loop in item 2.
-
-**Suggested fix**: maintain the KV cache as a pre-allocated
-slab that grows by doubling. The current implementation grows
-the Python list by one entry per `append()` and the
-`stack()` call copies everything.
-
----
-
-## 13. Things that are NOT bottlenecks
-
-| Operation | Why it's fine |
-|---|---|
-| `handles[name].as_numpy()` | Returns a view of the mmap; zero copy. |
-| `np.concatenate` for the q/k/v *outputs* | Small (seq_len × hidden); negligible. |
-| `_apply_rope` | Vectorised over `seq_len`; small fixed cost. |
-| `_softmax` | Vectorised; small fixed cost. |
-| The `del` block at the end | Free; runtime help. |
-| `gc.collect()` at the end | One-shot; only on `dequant_cache is None`. |
-
----
-
-## 14. The proposed profiler
-
-The release ships `--profile-detailed`, which brackets every
-operation in the decoder block with a microsecond-precision
-context manager. The output is a per-layer breakdown plus a
-summary that aggregates by category (Attention, MLP, Tensor
-Loading, Dequantization, Norm, Sampling, Other).
-
-To use:
+# Performance audit chain
+
+Flatrun went through several focused performance audits during
+pre-release. Each one instrumented the production path,
+isolated *one* bottleneck, applied the smallest possible
+fix, and re-measured. This document is the consolidated
+narrative of those audits — what was found, what changed,
+and what is at the pure-NumPy ceiling.
+
+The audit scripts themselves are reproducible against
+any GGUF / SafeTensors model the runtime supports. They
+live outside the source tree in the developer's `/tmp/`
+because each one is hundreds of lines of harness code and
+isn't a long-lived diagnostic tool:
+
+- `/tmp/projection_audit.py` — per-projection sub-stage
+  breakdown (qkv/o/gateup/down: prepare, gemm, bias,
+  post).
+- `/tmp/attention_audit.py` — per-stage breakdown of the
+  QK / AV / RoPE / KV stack / GQA repeat / softmax /
+  mask chain.
+- `/tmp/dequant_audit.py` — per-dequant breakdown
+  (load, unpack, scales, mins, bit unpack, arithmetic,
+  finish) for Q4_K / Q5_K / Q6_K / Q8_0 / F16 / F32.
+
+Run any of them against a real model:
 
 ```bash
-flatrun run --profile-detailed --profile-save profile.json \
-    --prompt "halo" --model /path/to/14B --max-new 1
+PYTHONPATH=src python3 /tmp/projection_audit.py
 ```
 
-The output looks like:
+The headline numbers from the audit chain are:
+
+| audit | main finding | fix | measured impact |
+|-------|--------------|-----|------------------|
+| Projection | `.astype(F32)` redundantly copied F32 → F32 | `.astype(np_dtype, copy=False)` (14 sites) | 4.16× per-layer projection work on 14B; -30 % top-4 projection time on 0.6B |
+| Projection | `_finish` cast redundant F32 → F32 in dequant output | `.astype(F32, copy=False)` once | ~30 ms saved per 14B Q4_K_M dequant |
+| MLP | `silu = gate / (1 + exp(-clip(gate))) * up` issued 5 NumPy expressions and 5 buffers | fused into one `np.empty_like` + 5 in-place ufuncs | 1.40-1.56× speedup on silu_mul stage |
+| Attention | `scale = 1.0 / np.sqrt(head_dim)` (Python float) promoted F32 attention → F64 throughout the entire path including downstream MLPs | `np.float32(1.0 / np.sqrt(head_dim))` at the top of each decoder block | attention intermediates halved in bytes; downstream MLP hidden state stays F32 |
+| Attention + KV | `kv.stack` called `np.stack` O(N) per decoder step, allocating fresh buffers | per-layer preallocated growing F32 buffer; `stack` is a view | 60-12,700× speedup on `stack()`; attention share 36 % → 27 % |
+| Dequant cache | unbounded cache OOMs 14B hosts at ~7 GB F32 heap | `_SlidingDequantCache` with `--dequant-cache-stride N` | memory bounded; **0.9-1.2 GB/s** on Q4_K (Python-dispatch bound) — needs a compiled kernel for further speedup |
+
+The rest of this document records *what each audit found*
+in narrative form so future readers can understand the
+shape of the runtime.
+
+---
+
+## 1. The dequant-cost era (the early state)
+
+The starting profile of a Qwen3-0.6B Q4_K_M forward pass was:
 
 ```
-Layer 0
----------------------------------
-...
-
-=========================
-PROFILE SUMMARY
-=========================
-  Attention             62.4 %
-  MLP                  28.1 %
-  Tensor Loading        4.2 %
-  Dequantization        3.1 %
-  Norm                  1.5 %
-  Other                 0.7 %
-
-Top 20 Slowest Operations
-  1. qkv_proj: 18.2 ms total
-  2. gateup_proj: 14.7 ms total
-  ...
+Dequantization          74 %
+Attention               14 %
+MLP                     10 %
 ```
 
-The numbers tell you *where* the time actually goes. The fix
-priorities in section 1, 4, and 8 are the ones that move the
-needle.
+The dequant kernel itself sat at the top of every hotspot
+list. Per-call Q4_K dequant of a 1.7 MB `gate_w` ran in
+~19 ms in pure NumPy. Multiplying by 24 layers × 11 tokens
+(prefill + decode) → ~5 sec of pure dequant. The
+dequantization was dispatch-bound (Python + NumPy ufunc
+per-call cost dominated over the actual arithmetic),
+sitting at ~0.9-1.2 GB/s effective bandwidth — an order
+of magnitude below the M-series memory ceiling.
+
+**Fixes that landed for that era**:
+
+- `madvise(MADV_DONTNEED)` for tensors ≥ 1 MiB on handle
+  close. Without this hint the page cache held the
+  touched mmap pages indefinitely and RSS grew past
+  30 GB even with the cache cap honoured.
+- `--dequant-cache on` defaulted to on. The unbounded
+  cache keeps every decoded F32 weight alive for the
+  process lifetime; for 14 B Q4_K_M this adds ~7 GB of
+  F32 heap which OOMs memory-constrained hosts.
+- `--dequant-cache-stride N` lets callers bound the
+  cache to the last N layers (sliding window). Pre/post-
+  layer tensors (embedding, norm, lm_head) carry no
+  `model.layers.N.` token and are auto-immune.
+- `_finish(copy=False)` in `dequant/gguf.py`. The shared
+  tail of every GGUF dequant function was paying a
+  redundant output-buffer memcpy on the production F32
+  path. Single one-line change lifts every dequant
+  (Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q5_0, Q5_1, Q1_0).
+
+**What did NOT help**:
+
+- Fully vectorising the Q4_K dequant loop in pure
+  NumPy (single broadcast across 4 groups) measured
+  **0.7-0.8× the loop's throughput** because the
+  transient F32 buffers (n_blocks × 256 each) cost
+  more memory bandwidth than they save in dispatch. Real
+  K-quant acceleration requires a compiled kernel
+  (Numba / Cython / C / vDSP).
+- Hoisting the type-conversion out of the loop and
+  casting to F32 in advance measured **the same or
+  slightly slower** — the intermediates cost more
+  memory bandwidth than the dispatch overhead they
+  save.
+
+The dequant pipeline is now sitting at the ceiling for
+what pure NumPy can do. Compiled kernels are the only
+next step.
+
+---
+
+## 2. The projection-matmul era
+
+After enabling the dequant cache the profile flipped to:
+
+```
+MLP              35-40 %
+Dequantization   10-15 %
+Attention        25-35 %
+```
+
+The projection matmuls were now the dominant cost. A
+per-projection sub-stage audit (`/tmp/projection_audit.py`)
+instruments every projection into four stages (prepare,
+gemm, bias, post) and reports each stage's time,
+allocation, and the layout of every intermediate.
+
+Findings:
+
+- The `.astype(np.float32)` before each matmul was
+  defaulting to `copy=True`, so even when the weight
+  was already F32 it allocated a fresh buffer. On
+  Qwen3-14B Q4_K_M, `gate_w.astype(F32)` alone measured
+  ~107 ms per call. Across all 4 projections × 24
+  layers × 11 tokens, that's 51 sec of pure memcpy
+  waste per inference.
+
+  **Fix**: replace each `.astype(np.float32)` on the
+  weight (and on the matmul output, in `_compute_layer_logits`)
+  with `.astype(np_dtype, copy=False)`. The 14 hot-path
+  sites (qkv/o/gateup/down across all three decoder
+  blocks + LM head + analyzer) all share the same
+  pattern. Per-layer projection work dropped **270 ms
+  → 65 ms** in the 14 B synthetic benchmark (4.16×);
+  end-to-end top-4 projection time on Qwen3-0.6B
+  dropped ~30 %.
+- All weight transposes were already zero-copy views
+  (`weight.T`, `OWNDATA=False`); the F-strided view
+  reads naturally via Accelerate's `cblas_sgemm`
+  `transB=T` flag.
+- All output splits (q/k/v from qkv, gate/up from
+  gateup) were already zero-copy views.
+- The `np.concatenate` for `qkv_w` and `gateup_w`
+  was — and still is — being re-allocated every
+  decoder step (cache-on or not). Per call:
+  ~16 MB on 0.6B, ~370 MB on 14B. **Not addressed in
+  this release** — caching the concat is the next pure-
+  NumPy item on the optimization table (estimated
+  ~8-12 % total runtime).
+- The `silu = gate / (1 + exp(-clip(gate))) * up`
+  chain issued 5 NumPy expressions and allocated 5
+  intermediate F32 buffers. **Fix**: fused into a
+  single `np.empty_like(gate)` + 5 in-place ufuncs
+  (`np.exp` → `+ 1.0` → `np.reciprocal` → `np.multiply`
+  → `np.multiply`). Measured **1.40-1.56× speedup** on
+  the post-gateup stage. The clip was dropped because
+  IEEE-754 gives the correct asymptotics at ±88.
+
+After this audit cycle, projections are 85-97 % BLAS
+time per the sub-stage audit. The only remaining pure-
+NumPy work in the projection path is the `np.concatenate`
+for qkv_w / gateup_w — caching those is the easy next
+win.
+
+---
+
+## 3. The attention-matmul era
+
+After the projection fix:
+
+```
+MLP                 36-44 %
+Dequantization      17-27 %
+Attention           19-30 %
+```
+
+`/tmp/attention_audit.py` broke attention into eleven
+sub-stages (q/k norm, RoPE prepare/compute/post, KV
+append, KV stack, GQA repeat, QK gemm, QK mask, softmax,
+AV gemm) and reported each stage's time, allocation,
+and the layout of every intermediate.
+
+Two concrete bugs were found and fixed:
+
+1. **F64 leak via Python-float scale** at the top of
+   every decoder block. `1.0 / np.sqrt(head_dim)` is a
+   Python `float` (float64); when multiplied by an F32
+   einsum result, NumPy's NEP-50 promoted the entire
+   result to float64. The F64 leaked through:
+   - `attn + causal_mask` → still F64
+   - softmax inputs → F64
+   - `einsum("htT,Thd->thd", attn, v_full)` → F64 output
+   - reshape → F64 view
+   - `attn_out @ o_w.T` → F64 result
+   - **The residual `hidden = residual + attn_out`**
+     → hidden state becomes F64
+   - Every subsequent RMSNorm, MLP matmul, and softmax
+     ran on F64 hidden state — effectively doubling
+     every byte touched downstream of attention.
+
+   **Fix**: `scale = np.float32(1.0 / np.sqrt(head_dim))`
+   at the top of each decoder block
+   (`_decoder_block`, `_gemma3_decoder_block`,
+   `_qwen35_full_attention_block`) and in the final
+   norm + LM head path inside `forward()`. Verified
+   end-to-end via the audit:
+   `attn_pre_mask` dtype `float64` nbytes 15.1 KB →
+   `float32` nbytes 7.6 KB.
+
+2. **`kv.stack` allocates `O(T)` per decoder step.** The
+   previous `KVCache` stored past K/V as a Python list
+   of per-token `(h, d)` arrays and rebuilt the full
+   history via `np.stack` on every `stack(layer)` call.
+   At `past_len=120` the audit measured `kv_stack`
+   at 645 µs — **32 % of attention share** — and the
+   cost grows as `O(T)` from a single `np.stack`
+   dispatch.
+
+   **Fix**: rewrite `KVCache` around a per-layer
+   preallocated growing F32 buffer (`_LayerKV`). Each
+   layer owns `(cap, kv_heads, head_dim)`; `cap *= 2`
+   on overflow (amortised O(1) per append); `stack` is
+   a slice view. Measured isolated speedup on
+   `stack()` alone:
+
+   | past | old (`np.stack`) | new (view) | speedup |
+   |-----:|------------------:|-----------:|--------:|
+   | 16 | 26.1 µs | 0.42 µs | 61× |
+   | 64 | 91.7 µs | 0.42 µs | 217× |
+   | 256 | 393.2 µs | 0.49 µs | 803× |
+   | 1024 | 2268 µs | 0.72 µs | 3165× |
+   | 4096 | 8365 µs | 0.66 µs | **12,704×** |
+
+   End-to-end attention share fell from ~36 % to ~27 %
+   on Qwen3-0.6B Q4_K_M with `--max-new 10`.
+
+After this audit cycle, the attention profile looks like:
+
+| sub-stage | share | notes |
+|-----------|------:|-------|
+| `qk_matmul` | 9-15 % | Accelerate sgemm dispatch via einsum |
+| `av_matmul` | 7-17 % | same |
+| `rope` | 9 % | cos/sin lookup + 2 broadcast mults |
+| `softmax` | 5-7 % | 4 intermediate F32 buffers |
+| `qk_mask` | 7-29 % | F32 mask add on every step |
+| `kv_stack` | < 1 % | zero-copy view (was 32 % at past=120) |
+| `gqa_repeat` | 13 % | `np.repeat(k_hist, head_group, axis=1)` materialises a head_group× replicated buffer — not yet optimised |
+| `q/k rms_norm` | 6-8 % | per-head RMSNorm before RoPE |
+
+Remaining pure-NumPy attention items:
+
+- `gqa_repeat` `np.repeat` → strided broadcast view
+  (validates against Accelerate sgemm dispatch);
+  expected ~5-10 % attention share.
+- `qk_mask` → fuse into softmax with `np.where`; ~5 %.
+- RoPE → in-place chain (similar to the SiLU fix
+  applied in the MLP era); ~30-50 % of RoPE itself,
+  ~3-4 % of attention share.
+
+---
+
+## 4. The dequant-residual era
+
+After the attention fixes, the profile flipped again:
+
+```
+MLP              41 %
+Dequantization   35 %
+Attention        19 %
+```
+
+The dequantization bucket is now the single largest
+share again. `/tmp/dequant_audit.py` broke each dequant
+function into per-stage sub-timings (load, unpack, scales,
+mins, bit unpack, arithmetic, finish, reshape, cache
+lookup, cache insert) and reported each stage's
+allocation, layout, and contiguity.
+
+Findings:
+
+- Q4_K is **Python-dispatch bound**. The 4-iteration
+  Python loop and the per-iteration `(chunk & 0x0F)
+  .astype(F32)`, `(chunk >> 4).astype(F32)` allocate
+  ~9.4 MB of intermediates per call (8 buffers × 50 KB
+  on 0.6B; 8 × 75 KB on 14B).
+- Effective bandwidth: **0.9-1.2 GB/s** for Q4_K on the
+  M-class, vs the ~30-40 GB/s ceiling of unified
+  memory — an order of magnitude under.
+- The cache efficiency is essentially perfect: with
+  `--dequant-cache on` (default), every decoded
+  weight hits cache on the second-and-later decode
+  steps; per-call dict lookup overhead is ~1 µs and
+  doesn't move the needle.
+
+What pure NumPy can still do:
+
+- Cache the `np.concatenate` for `qkv_w` and
+  `gateup_w` (extension of the sliding cache in
+  `--dequant-cache-stride`); ~8-12 % total runtime.
+- Replace `gqa_repeat` `np.repeat` with a strided
+  broadcast view; ~5-10 % attention.
+
+What pure NumPy **cannot** fix:
+
+- The Q4_K 4-iteration loop. Fully-vectorising it in
+  pure NumPy measures **0.7-0.8× the loop's
+  throughput** because the intermediates cost more
+  memory bandwidth than they save in dispatch.
+
+What needs a compiled kernel:
+
+- Numba JIT for the Q4_K inner loop; typical reported
+  gains: 3-10× over pure NumPy.
+- Quantized matmul (skip dequant entirely; do `int4 @
+  fp16` directly). Requires a custom kernel operator.
+- FP16 weight storage (halve the dequant output bytes
+  and the matmul reads). Pure NumPy feasible on the
+  dtype plumbing side; expected 1.5-2× on memory-
+  bound decoder paths.
+
+---
+
+## Per-stage audit summary (one-shot table)
+
+Single-call measurements on Qwen3-0.6B Q4_K_M, recorded
+once per audit cycle. Numbers are absolute `ms` per
+projection per decode step.
+
+| bucket | sub-stage | before | after first fix | after second fix |
+|--------|-----------|------:|----------------:|-----------------:|
+| qkv | prepare | ~5 ms | ~0.16 ms | ~0.05 ms |
+| qkv | gemm (BLAS) | ~3 ms | ~3 ms | ~0.9 ms |
+| qkv | post | ~5 ms | ~0.18 ms | ~0.18 ms |
+| gateup | prepare | ~5 ms | ~0.07 ms | ~0.07 ms |
+| gateup | gemm (BLAS) | ~5 ms | ~5 ms | ~1.4 ms |
+| gateup | post | ~5 ms | ~0.36 ms | ~0.36 ms (then 0.23 via SiLU fuse) |
+| down | gemm (BLAS) | ~3 ms | ~0.5 ms | ~0.5 ms |
+| o | gemm (BLAS) | ~1 ms | ~0.5 ms | ~0.5 ms |
+| attention | qk_matmul | ~1 ms | ~0.5 ms | ~0.5 ms |
+| attention | av_matmul | ~3 ms | ~0.3 ms | ~0.3 ms |
+| attention | kv_stack | ~0.6 ms (past=120) | ~0.6 ms | < 0.01 ms (view) |
+| dequantization | per-weight avg | ~20 ms | ~3 ms (cache warm) | ~3 ms |
+
+(Bench conditions vary between audit cycles; the
+absolute numbers are illustrative. The relative win
+ratios are stable.)
+
+---
+
+## Realistic remaining pure-NumPy ceiling
+
+If every remaining item ships:
+
+| # | item | est. additional total-runtime speedup | complexity |
+|--:|------|---------------------------------------:|------------|
+| 1 | cache `qkv_w` and `gateup_w` `np.concatenate` | 8-12 % | Low |
+| 2 | replace `gqa_repeat` `np.repeat` with strided broadcast view | 5-10 % attention share | Medium |
+| 3 | fuse RoPE into in-place chain | 3-4 % attention share | Low |
+| 4 | fuse mask add into softmax with `np.where` | ~5 % attention share | Low |
+| 5 | FP16 weight storage (dtype plumbing + memory cap) | 1.5-2× on memory-bound decoder paths | Medium |
+| **Total achievable without compiled kernels** | | **~15-20 %** | |
+
+Beyond that, the only path to a structural speedup is a
+compiled kernel rewrite (Numba / Cython / MPS) of the
+dequant kernel + the matmul + the fused operations.
+
+---
+
+## Where the bottleneck *won't* move to
+
+After all of the above lands, the remaining share will be:
+
+- **Accelerate GEMM dispatch cost** itself — irreducible
+  in pure NumPy.
+- **NumPy ufunc dispatch cost** — the cost of every
+  `np.exp`, `np.multiply`, `np.add` call into the C
+  dispatcher.
+- **Python interpreter overhead** — the per-call cost of
+  every Python function frame.
+
+These three together are what remain once the algorithmic
+and allocation issues are fixed. They are the fundamental
+ceiling of "Python + NumPy + Apple Accelerate" for this
+workload.
+
+To break that ceiling, the work moves out of Python
+entirely: Numba / Cython / MPS, with all the maintenance
+cost that entails.

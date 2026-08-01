@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "FlatRun Contributors" },
+    { name = "Flatrun Contributors" },
 ]
 keywords = [
     "llm",
@@ -36,7 +36,7 @@ dev = [
     "mypy>=1.8.0",
     "ruff>=0.2.0",
 ]
-# Optional. Used only by ``SafetensorsLibBackend``; the default FlatRun
+# Optional. Used only by ``SafetensorsLibBackend``; the default Flatrun
 # SafeTensors backend does its own parsing and has no third-party deps.
 safetensors = [
     "safetensors>=0.4.0",
