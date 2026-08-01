@@ -228,15 +228,16 @@ def _make_q4_k_bytes(seed: int, n_blocks: int) -> bytes:
 
 
 def _make_q6_k_bytes(seed: int, n_blocks: int) -> bytes:
+    """Q6_K layout: ql[128] | qh[64] | scales[16] | d (FP16)."""
     import struct
     rng = np.random.default_rng(seed)
     out = bytearray()
     for _ in range(n_blocks):
-        d = float(rng.uniform(0.01, 1.0))
-        out += struct.pack("<e", d)
         out += bytes(rng.integers(0, 16, size=128, dtype=np.uint8))
         out += bytes(rng.integers(0, 4, size=64, dtype=np.uint8))
         out += bytes(rng.integers(-127, 127, size=16, dtype=np.int8))
+        d = float(rng.uniform(0.01, 1.0))
+        out += struct.pack("<e", d)
     return bytes(out)
 
 

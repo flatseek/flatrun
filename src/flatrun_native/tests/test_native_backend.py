@@ -41,14 +41,15 @@ def _make_q4_k_bytes(seed: int, n_blocks: int) -> bytes:
 
 
 def _make_q6_k_bytes(seed: int, n_blocks: int) -> bytes:
+    """Q6_K layout: ql[128] | qh[64] | scales[16] | d (FP16)."""
     rng = np.random.default_rng(seed)
     out = bytearray()
     for _ in range(n_blocks):
-        d = float(rng.uniform(0.01, 1.0))
-        out += struct.pack("<e", d)
         out += bytes(rng.integers(0, 16, size=128, dtype=np.uint8))
         out += bytes(rng.integers(0, 4, size=64, dtype=np.uint8))
         out += bytes(rng.integers(-127, 127, size=16, dtype=np.int8))
+        d = float(rng.uniform(0.01, 1.0))
+        out += struct.pack("<e", d)
     return bytes(out)
 
 
@@ -245,7 +246,12 @@ def test_q8_0_0d_input_raises() -> None:
 
 
 def test_q4k_mt_matches_st() -> None:
-    """Q4_K multi-threaded output matches single-threaded."""
+    """Q4_K multi-threaded output matches single-threaded.
+
+    The single-token call dispatches to the ST kernel; the batched
+    call (seq=1) dispatches to the MT kernel internally. The two
+    paths must agree at FP32 round-off.
+    """
     if not is_available():
         return
     import flatrun_native._C as _C
@@ -253,15 +259,9 @@ def test_q4k_mt_matches_st() -> None:
     raw = np.frombuffer(_make_q4_k_bytes(7, n * k // 256), dtype=np.uint8)
     x = np.random.default_rng(99).standard_normal(k).astype(np.float32)
 
-    # Single-threaded (n_threads=1)
+    # Single-threaded (matmul_q4_k)
     out_st = _C.matmul_q4_k(x.copy(), raw, n, k)
-
-    # Multi-threaded (n_threads=4)
-    from flatrun_native.kernels.q4_k import matmul_q4_k_mt  # noqa
-    out_mt = np.zeros(n, dtype=np.float32)
-    # The kernels module is in C++ — invoke via the C++ binding which
-    # uses single-threaded path. We rely on the batched path which
-    # uses _mt internally; verify it matches single-threaded.
+    # batched (uses _mt internally on ARM; falls back to ST on x86)
     out_batched = _C.matmul_q4_k_batched(x.reshape(1, k), raw, n, k)[0]
 
     np.testing.assert_allclose(out_st, out_batched, atol=1e-4)

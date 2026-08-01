@@ -29,6 +29,12 @@ from flatrun_native import NativeBackend, is_available  # noqa: E402
 def _make_q6_k_bytes(seed: int, n_blocks: int) -> bytes:
     """Generate valid Q6_K block bytes.
 
+    Q6_K layout (210 bytes per 256 elements):
+        uint8_t  ql[128];     // low 4 bits
+        uint8_t  qh[64];      // high 2 bits
+        int8_t   scales[16];  // signed, one per 16 elements
+        ggml_half d;          // super-block scale (FP16)
+
     Q6_K has 6-bit quant values (0..63) and signed 8-bit scales
     (-128..127). The super-block scale (d) is FP16. We randomise
     all of these within their valid ranges to exercise the
@@ -37,9 +43,6 @@ def _make_q6_k_bytes(seed: int, n_blocks: int) -> bytes:
     rng = np.random.default_rng(seed)
     out = bytearray()
     for _ in range(n_blocks):
-        # d: positive FP16 in [0.01, 1.0]
-        d = float(rng.uniform(0.01, 1.0))
-        out += struct.pack("<e", d)
         # ql: 128 bytes (low 4 bits of each value)
         ql = rng.integers(0, 16, size=128, dtype=np.uint8)
         out += bytes(ql)
@@ -49,6 +52,9 @@ def _make_q6_k_bytes(seed: int, n_blocks: int) -> bytes:
         # scales: 16 signed int8
         scales = rng.integers(-127, 127, size=16, dtype=np.int8)
         out += bytes(scales)
+        # d: positive FP16 in [0.01, 1.0] — last 2 bytes of the block
+        d = float(rng.uniform(0.01, 1.0))
+        out += struct.pack("<e", d)
     return bytes(out)
 
 

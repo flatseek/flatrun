@@ -164,18 +164,29 @@ Support for additional architectures is continuously expanding.
 
 # Installation
 
+Install from PyPI:
+
+```bash
+pip install flatrun
+```
+
+Or clone + editable install:
+
 ```bash
 git clone https://github.com/flatseek/flatrun.git
 
 cd flatrun
 
 make install
+# or, to enable the native C++ backend:
+pip install -e ".[native]"
 ```
 
 Requirements:
 
 - Python 3.10+
 - NumPy
+- (Optional) a C++ toolchain + pybind11 for the native backend
 
 ---
 
