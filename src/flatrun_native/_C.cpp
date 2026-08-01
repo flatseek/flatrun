@@ -187,7 +187,11 @@ static py::array_t<float> matmul_q4_k_batched_py(
     const float*   xp  = static_cast<const float*>(x_buf.ptr);
 
     for (std::size_t s = 0; s < seq; ++s) {
+#if defined(FRN_NEON)
         matmul_q4_k_mt(raw, xp + s * k, &out_mut(s, 0), n, k);
+#else
+        matmul_q4_k(raw, xp + s * k, &out_mut(s, 0), n, k);
+#endif
     }
     return out;
 }
@@ -228,7 +232,11 @@ static py::array_t<float> matmul_q8_0_batched_py(
     const float*   xp  = static_cast<const float*>(x_buf.ptr);
 
     for (std::size_t s = 0; s < seq; ++s) {
+#if defined(FRN_NEON)
         matmul_q8_0_mt(raw, xp + s * k, &out_mut(s, 0), n, k);
+#else
+        matmul_q8_0(raw, xp + s * k, &out_mut(s, 0), n, k);
+#endif
     }
     return out;
 }
