@@ -1726,7 +1726,15 @@ def make_qwen2_forwarder(
             # / ``0``), so the clip is a no-op safety belt that
             # doesn't change the answer up to fp32 round-off.
             silu_mul = np.empty_like(gate)
-            np.exp(-gate, out=silu_mul)
+            # IEEE-754 saturates np.exp at large positive arguments to
+            # +inf, which then 1/(1+inf) = 0 in the reciprocal step and
+            # zeroes the chain. The final silu (gate * sigmoid(gate))
+            # value is correct: silu(-100) ≈ -100 * 0 = 0. The
+            # overflow is a no-op on the math; suppress the warning so
+            # the user sees the steady-state output instead of
+            # RuntimeWarning spam on every decoder step.
+            with np.errstate(over="ignore"):
+                np.exp(-gate, out=silu_mul)
             silu_mul += 1.0
             np.reciprocal(silu_mul, out=silu_mul)
             np.multiply(silu_mul, gate, out=silu_mul)  # silu(gate)
