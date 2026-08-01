@@ -36,8 +36,34 @@ enabling inference on models larger than available system RAM.
 </div>
 
 ---
+### See how it work
 
-# Flatrun
+```bash
+flatrun chat --model ./Qwen3-0.6B-Q4_K_M.gguf
+```
+
+```text
+Detected format: gguf
+Building tokenizer from GGUF metadata (Qwen3-0.6B-Q4_K_M.gguf) ...
+Tokenizer vocab: 151936
+Chat template: Qwen2 ChatML
+  bumping cache from 256 MiB to 512 MiB (largest tensor is 122 MiB)
+Loaded model in 1.62 s; layers=28
+
+Chat mode (max_new=128/turn, history=True).
+Type your message; Ctrl-D (EOF) or 'exit' to quit.
+
+You: where is paris?
+
+Assistant:
+Paris is the capital and largest city of France. It is located in the
+north-central part of the country along the Seine River and is known for
+landmarks such as the Eiffel Tower, the Louvre Museum, and Notre-Dame
+Cathedral.
+
+```
+---
+# Overview
 
 **A pure Python and NumPy runtime for AI inference research and optimization.**
 
@@ -48,100 +74,23 @@ Instead of treating a model as a single monolithic file, Flatrun streams weights
 This streaming architecture allows models significantly larger than available system RAM to run on commodity hardware, trading throughput for dramatically lower memory usage.
 
 ---
-
 # Why Flatrun?
 
-Most inference runtimes are optimized for maximum throughput.
+Flatrun is designed for developers and researchers who want to understand how LLM inference works.
 
-Flatrun is optimized for understanding how inference works.
-
-Its goal is to provide a transparent, hackable runtime where every part of the execution pipeline can be inspected, profiled, modified, and improved.
-
-Whether you're experimenting with:
-
-- Streaming execution
-- Layer schedulers
-- Memory-aware runtimes
-- Quantization algorithms
-- KV cache designs
-- Forward-pass optimizations
-- New execution strategies
-
-Flatrun gives you a clean, readable codebase instead of hiding the implementation behind thousands of lines of optimized C++.
-
-Core principles:
-
-- Stream layers instead of entire checkpoints
-- Keep peak memory nearly constant
-- Make every subsystem inspectable
-- Optimize through measurement instead of assumptions
-- Build an inference runtime designed for research
+It provides a transparent streaming runtime where every stage—from tensor loading to KV cache management and forward execution—can be inspected, profiled, modified, and optimized.
 
 ---
+# Highlights
 
-# Features
-
-## Streaming Runtime
-
-- Layer-by-layer model execution
-- mmap-based tensor loading
-- Zero-copy tensor access
-- Automatic layer eviction
-- Configurable memory cache
-- Layer prefetch support
-
-## Pure Python Runtime
-
-- Pure NumPy forward implementation
-- No PyTorch dependency
-- No Transformers runtime
-- CPU-first execution
-- BLAS acceleration through system libraries
-
-## Native Acceleration
-
-- Optional C++ backend
-- Quantized GEMM kernels
-- Optimized dequantization
-- SIMD-friendly implementations
-- Compatible with the Python runtime
-
-## Storage Backends
-
-- GGUF
-- SafeTensors
-- MLX 4-bit
-- Multi-shard checkpoints
-
-## Quantization Support
-
-- Q1_0
-- Q4_0
-- Q4_K
-- Q5_0
-- Q5_1
-- Q5_K
-- Q6_K
-- Q8_0
-- MLX 4-bit
-
-## Runtime Components
-
-- Streaming scheduler
-- Growing KV cache
-- Optional dequant cache
-- Sliding cache window
-- Interactive chat
-- Python API
-
-## Diagnostics
-
-- Layer profiler
-- Memory tracing
-- Prediction evolution
-- Hidden-state debugging
-- JSON profiling reports
-
+- Streaming layer-by-layer execution
+- Constant-memory architecture
+- Pure Python + NumPy runtime
+- Optional native C++ acceleration
+- GGUF, SafeTensors, and MLX support
+- Q1/Q4/Q5/Q6/Q8 quantization
+- Python API and interactive chat
+- Layer profiler and memory tracing
 ---
 
 # Supported Models
@@ -169,8 +118,8 @@ Install from PyPI:
 ```bash
 pip install flatrun
 ```
-
 Or clone + editable install:
+
 
 ```bash
 git clone https://github.com/flatseek/flatrun.git
@@ -178,15 +127,12 @@ git clone https://github.com/flatseek/flatrun.git
 cd flatrun
 
 make install
-# or, to enable the native C++ backend:
-pip install -e ".[native]"
 ```
 
 Requirements:
 
 - Python 3.10+
 - NumPy
-- (Optional) a C++ toolchain + pybind11 for the native backend
 
 ---
 
@@ -303,79 +249,49 @@ print(tokenizer.decode(out))
 ```
 
 ---
-
 # CLI
-
-Commands
 
 ```bash
 flatrun run
 flatrun chat
 ```
 
-Generation
+Supports:
 
-- max-new
-- temperature
-- top-k
-- top-p
-- sampling
-- repeat penalty
+- Text generation and sampling
+- Python and native backends
+- Runtime and cache configuration
+- Quantization overrides
+- Layer selection
+- Profiling and debugging
 
-Runtime
-
-- cache size
-- dequant cache
-- layer selection
-- quant override
-
-Diagnostics
-
-- profile
-- profile-detailed
-- debug
-- memory-trace
-- JSON reports
+See `flatrun run --help` for the complete command reference.
 
 ---
-
 # How It Works
 
 ```text
-Input Tokens
+Model on Disk
       │
       ▼
- Embedding
+ Load Layer
       │
       ▼
-Acquire Layer
+ Execute
       │
-Load Tensors
+      ▼
+ Update KV
       │
-Execute Forward
-      │
-Update KV Cache
-      │
+      ▼
 Release Layer
       │
-Repeat For Every Decoder Layer
-      │
       ▼
- Final RMSNorm
-      │
-      ▼
-   LM Head
-      │
-      ▼
-    Logits
+ Next Layer
 ```
 
-Only a single decoder layer needs to be resident in memory at any time.
-
-This keeps peak memory nearly constant regardless of model size while enabling inference on models that exceed available RAM.
+Instead of loading an entire checkpoint into memory, Flatrun streams one decoder layer at a time. Only the active layer and KV cache remain resident in memory, keeping peak RAM nearly constant regardless of model size.
 
 ---
-
 # Performance
 
 Flatrun prioritizes memory efficiency over maximum throughput.

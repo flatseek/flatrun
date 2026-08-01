@@ -84,6 +84,9 @@ include = ["flatrun*"]
 [tool.pytest.ini_options]
 testpaths = ["src/flatrun/tests", "src/flatrun_native/tests"]
 addopts = "-ra --strict-markers"
+markers = [
+    "network: download a real model from HuggingFace. Skipped in CI; run locally with `pytest -m network`.",
+]
 
 [tool.ruff]
 line-length = 100
