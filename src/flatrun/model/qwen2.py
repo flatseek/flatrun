@@ -741,10 +741,31 @@ def make_qwen2_forwarder(
         elif _head_w_cache is not None:
             head_w = _head_w_cache
         else:
-            head_w = _fetch_proj(
-                handles, -1, "lm_head", config, np_dtype,
-                dequant_cache=dequant_cache,
+            # Symmetric with the norm_w block above: prefer the
+            # handles dict when the scheduler attached lm_head
+            # (last selected layer), fall back to the manager
+            # otherwise. Without the manager fallback the
+            # prediction-evolution analyzer would crash on the
+            # first layer of an untied model (Qwen3-14B and
+            # friends) because lm_head is a post-layer tensor
+            # the scheduler only attaches to the last layer.
+            head_in_handles = (
+                "lm_head.weight" in handles
+                or "language_model.lm_head.weight" in handles
             )
+            if head_in_handles:
+                head_w = _fetch_proj(
+                    handles, -1, "lm_head", config, np_dtype,
+                    dequant_cache=dequant_cache,
+                )
+            else:
+                head_handle = mgr.acquire("lm_head.weight")
+                if head_handle.metadata.quantization is not None:
+                    head_w = dequant_handle(head_handle, dtype=np_dtype.name)
+                else:
+                    head_w = head_handle.as_numpy().astype(np_dtype)
+                if dequant_cache is not None:
+                    dequant_cache["lm_head.weight"] = head_w
             head_w = _as_linear(head_w, config.hidden_size, "lm_head")
             _head_w_cache = head_w
 
