@@ -1415,7 +1415,7 @@ def make_qwen2_forwarder(
             k_full = np.repeat(k_hist, head_group, axis=1)
             v_full = np.repeat(v_hist, head_group, axis=1)
 
-        scale = 1.0 / np.sqrt(head_dim)
+        scale = np.float32(1.0 / np.sqrt(head_dim))
         with _p("qk_matmul", _P):
             attn = np.einsum("thd,Thd->htT", q, k_full) * scale
         with _p("causal_mask", _P):
@@ -1616,7 +1616,7 @@ def make_qwen2_forwarder(
         k_full = np.repeat(k_hist, head_group, axis=1)
         v_full = np.repeat(v_hist, head_group, axis=1)
 
-        scale = 1.0 / np.sqrt(attn_scale)
+        scale = np.float32(1.0 / np.sqrt(attn_scale))
         attn = np.einsum("thd,Thd->htT", q, k_full) * scale
         attn = attn + _causal_mask(seq_len, past_len, config.sliding_window)
         # Gemma 2/3 default soft-cap (50.0) prevents the Q.K product
@@ -1776,7 +1776,7 @@ def make_qwen2_forwarder(
         k_full = np.repeat(k_hist, head_group, axis=1)
         v_full = np.repeat(v_hist, head_group, axis=1)
 
-        scale = 1.0 / np.sqrt(head_dim)
+        scale = np.float32(1.0 / np.sqrt(head_dim))
         attn = np.einsum("thd,Thd->htT", q, k_full) * scale
         attn = attn + _causal_mask(seq_len, past_len, config.sliding_window)
         attn = _softmax(attn, axis=-1)
