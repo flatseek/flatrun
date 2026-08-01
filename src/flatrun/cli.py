@@ -1008,14 +1008,17 @@ def _build_argparser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser
     shared.add_argument(
         "--dequant-cache",
         choices=["on", "off"],
-        default="off",
+        default="on",
         help="Keep dequantized weight tensors in Python heap across "
-             "layers. ``off`` (default) is true streaming: every layer "
-             "is dequantized fresh and the result is released as soon "
-             "as the layer finishes, so the Python heap stays nearly "
-             "constant. ``on`` trades RAM for speed by caching every "
-             "dequantized weight until the process exits. Set ``on`` "
-             "only for short-running experiments on small models.",
+             "layers. ``on`` (default) trades RAM for speed by caching "
+             "every dequantized weight until the process exits so the "
+             "second-and-later decode steps don't redo the dequant "
+             "work. ``off`` is true streaming: every layer is "
+             "dequantized fresh and the result is released as soon as "
+             "the layer finishes, so the Python heap stays nearly "
+             "constant — pass ``off`` on memory-constrained hosts "
+             "and on large models (>= 14 B) where the cached "
+             "float32 buffers would push RSS past the host limit.",
     )
     shared.add_argument(
         "--memory-trace",

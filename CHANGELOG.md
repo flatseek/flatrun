@@ -44,6 +44,15 @@ versions follow [Semantic Versioning](https://semver.org/).
   garbage.
 - **Gemma 3** support (MLX-4bit). Per-MLP RMSNorm, gated
   attention, qk-norm gain all wired correctly.
+- **`--dequant-cache` defaults to `on`**. The CLI now keeps
+  dequantized F32 weights in the Python heap for the process
+  lifetime so the second-and-later decode steps don't redo the
+  dequant work. On a Qwen3-0.6B Q4_K_M model this drops the
+  detailed profile's "Dequantization" share from ~74% to a
+  single-digit percentage after the first step. Memory
+  tradeoff: ~1.5 GB extra heap for 0.6B, ~7 GB for 14B. Pass
+  `--dequant-cache off` to opt back into pure streaming mode
+  on memory-constrained hosts or large models.
 
 ### Removed
 
