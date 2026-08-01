@@ -266,6 +266,19 @@ class LiveThinkingDisplay:
     MAX_WORDS = 15  # 10-20 words before the window scrolls
     PLACEHOLDER_BODY = "..."  # shown on the thinking line for non-reasoning models
 
+    # ``\033[999;1H`` = "move cursor to row 999, column 1". Any
+    # reasonable terminal has fewer than 999 visible rows, so the
+    # Thinking line never collides with the streamed reply on
+    # stdout. ``\033[K`` = "clear from cursor to end of line" - used
+    # before every paint so the old cursor frame doesn't bleed through
+    # the new one. Critically, the animation thread *never* paints
+    # unless ``_active`` is True (set by ``_activate`` from the
+    # state-machine path inside ``feed_token``) - non-reasoning
+    # models never see a spinner at all, fixing the long-standing
+    # "⠏Moo⠙ligh⠼'⠧ ..." interleaving bug caused by the previous
+    # design's unconditional placeholder.
+    _ROW_ANCHOR = "\033[999;1H"
+
     def __init__(self, stream=None) -> None:
         self._stream = stream or sys.stderr
         self._thread = None
@@ -298,10 +311,17 @@ class LiveThinkingDisplay:
         self._placeholder_on_screen = False
 
     def __enter__(self) -> "LiveThinkingDisplay":
-        # Always start the animation thread: for non-reasoning models
-        # the placeholder line must still pulse. The thread itself
-        # gates on ``_active`` so the very first tick is the one that
-        # paints the placeholder.
+        # Always start the animation thread. It gates on
+        # ``_active``: for non-reasoning models ``_active`` stays
+        # False forever and the thread is a harmless no-op that
+        # wakes every tick to check the gate. The placeholder is
+        # painted only from ``_activate``, which the state machine
+        # calls from ``feed_token`` when the model emits
+        # ``<think ...>`` — so non-reasoning models never see a
+        # spinner at all (the previous design unconditionally painted
+        # the placeholder on the first tick, which is what produced
+        # the "⠏Moo⠙ligh⠼'⠧ ..." interleaving bug on stdout's
+        # streamed line).
         self._stop = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -319,7 +339,9 @@ class LiveThinkingDisplay:
         if self._active:
             with self._lock:
                 try:
-                    self._stream.write("\r\x1b[K")
+                    # Clear the Thinking line at row 999 and rewind
+                    # so the caller's next write lands BELOW it.
+                    self._stream.write(f"{self._ROW_ANCHOR}\x1b[K\n")
                     self._stream.flush()
                 except Exception:
                     pass
@@ -345,7 +367,8 @@ class LiveThinkingDisplay:
         self._placeholder_on_screen = True
         try:
             self._stream.write(
-                f"\n{_C_DIM}Thinking:{_C_END} "
+                f"{self._ROW_ANCHOR}\x1b[K"
+                f"{_C_DIM}Thinking:{_C_END} "
                 f"{_C_GREY}{_C_ITALIC}{self.PLACEHOLDER_BODY}{_C_END}"
                 f"{_C_YELLOW}{self._rendered_frame}{_C_END}"
             )
@@ -508,7 +531,8 @@ class LiveThinkingDisplay:
         self._placeholder_on_screen = False
         try:
             self._stream.write(
-                f"\r\x1b[K{_C_DIM}Thinking:{_C_END} "
+                f"{self._ROW_ANCHOR}\x1b[K"
+                f"{_C_DIM}Thinking:{_C_END} "
                 f"{_C_GREY}{_C_ITALIC}{self._content}{_C_END}"
                 f"{_C_YELLOW}{self._rendered_frame}{_C_END}"
             )
@@ -544,28 +568,34 @@ class LiveThinkingDisplay:
             self._advance_cursor()
             return
         try:
-            # ``\b`` rewinds one column so the new write overwrites
-            # the trailing cursor frame rather than appending past
-            # it. The grey italic run is closed (back to default
-            # attributes) at the end of the body chunk so the yellow
-            # cursor frame keeps its colour.
+            # ``\033[999;1H\x1b[K`` clears the reserved bottom row
+            # and rewrites the body chunk + cursor frame on it. The
+            # body chunk is the full ``self._content`` (not just
+            # ``new_chars``) because a full-row rewrite is cheaper
+            # than tracking per-column diffs and the line is short;
+            # ``\x1b[K`` after the cursor frame blanks any trailing
+            # colour state so the next stdout write isn't tinted by
+            # the yellow cursor.
             self._stream.write(
-                f"\b{_C_GREY}{_C_ITALIC}{new_chars}{_C_END}"
-                f"{_C_YELLOW}{self._rendered_frame}{_C_END}"
+                f"{self._ROW_ANCHOR}\x1b[K"
+                f"{_C_GREY}{_C_ITALIC}{self._content}{_C_END}"
+                f"{_C_YELLOW}{self._rendered_frame}{_C_END}\x1b[K"
             )
             self._stream.flush()
-            self._rendered_len += len(new_chars)
+            self._rendered_len = len(self._content)
         except Exception:
             pass
 
     def _advance_cursor(self) -> None:
         """Rewrite just the trailing cursor frame, leaving the
-        content untouched. Cheap enough to run on every animation
-        tick (the buffer is empty so we only emit two bytes).
+        content untouched. Always anchored at the reserved bottom
+        row so the cursor can't bleed into the streamed reply on
+        stdout.
         """
         try:
             self._stream.write(
-                f"\b{_C_YELLOW}{self._rendered_frame}{_C_END}"
+                f"{self._ROW_ANCHOR}\x1b[K"
+                f"{_C_YELLOW}{self._rendered_frame}{_C_END}"
             )
             self._stream.flush()
         except Exception:
@@ -573,31 +603,23 @@ class LiveThinkingDisplay:
 
     def _run(self) -> None:
         i = 0
-        # First tick: flip the line live if it isn't already. This
-        # is what makes the placeholder appear at the start of
-        # generation - we don't have to know in advance whether the
-        # model is reasoning or not.
-        first_tick = True
         while not self._stop:
-            frame = _LIVE_CURSOR_FRAMES[i % len(_LIVE_CURSOR_FRAMES)]
             with self._lock:
-                if first_tick:
-                    first_tick = False
-                    # If ``feed_token`` already activated the line
-                    # before the thread got its first tick, do
-                    # nothing extra here - the placeholder is
-                    # already on screen.
-                    if not self._active:
-                        self._activate()
-                        # Skip this tick's frame advance; the
-                        # cursor was just painted.
-                        i += 1
-                        time.sleep(_LIVE_CURSOR_INTERVAL)
-                        continue
-                if frame != self._rendered_frame:
-                    self._rendered_frame = frame
-                    self._advance_cursor()
-            i += 1
+                # Gate on ``_active``. For non-reasoning models
+                # this is False for the entire generation and the
+                # thread just sleeps through every tick - that is
+                # the whole point of the previous bug fix: we no
+                # longer paint a placeholder for models that
+                # never open a ``<think ...>`` tag. The placeholder
+                # is painted only from ``_activate``, which the
+                # state machine calls when the open tag actually
+                # arrives.
+                if self._active:
+                    frame = _LIVE_CURSOR_FRAMES[i % len(_LIVE_CURSOR_FRAMES)]
+                    if frame != self._rendered_frame:
+                        self._rendered_frame = frame
+                        self._advance_cursor()
+                    i += 1
             time.sleep(_LIVE_CURSOR_INTERVAL)
 
 
