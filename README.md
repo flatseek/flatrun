@@ -30,9 +30,10 @@ enabling inference on models larger than available system RAM.
 [Flatseek](https://github.com/flatseek/flatseek) (Keyword Search) •
 [Flatvec](https://github.com/flatseek/flatvec) (Vector Search) •
 [Flatask](https://github.com/flatseek/flatask) (RAG Runtime) •
-[Flatweight](https://github.com/flatseek/flatweight) (AI Model Storage) •
+[Flatlens](https://github.com/flatseek/flatlens) (Data Visualization) •
+[Flatbuild](https://github.com/flatseek/flatbuild) (LLM Training) •
 [Flattune](https://github.com/flatseek/flattune) (LLM Fine-Tuning) •
-[Flatlens](https://github.com/flatseek/flatlens) (Data Visualization)
+[Flatrun](https://github.com/flatseek/flatrun) (LLM Inference)
 
 </div>
 
