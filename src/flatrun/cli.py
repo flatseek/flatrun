@@ -1679,6 +1679,7 @@ def _generate_continuation(
     executor = bundle["executor"]
     tokenizer = bundle["tokenizer"]
     sampler = _make_sampler(args)
+    stop_ids = getattr(tokenizer, "stop_token_ids", lambda: set())()
     seen: list[int] = list(prompt_ids)
     step_times: list[float] = []
     logits: np.ndarray | None = None
@@ -1689,7 +1690,7 @@ def _generate_continuation(
     flush_token = (lambda: None) if stream is None else (lambda: stdout_token_flush())
 
     for nxt in range(max_new):
-        ids = prompt_ids + generated if next_id == -1 else prompt_ids + generated
+        ids = prompt_ids + generated
         t0 = time.perf_counter()
         result = executor.step(tokens=ids)
         step_times.append((time.perf_counter() - t0) * 1000)
@@ -1702,6 +1703,11 @@ def _generate_continuation(
             next_id = int(np.argmax(logits[-1]))
         else:
             next_id = sampler.sample(logits[-1], seen_ids=seen)
+        # Stop on the model's end-of-sequence token before it is added
+        # to the output or streamed, so a stop marker never appears in
+        # the generated reply.
+        if next_id in stop_ids:
+            break
         generated.append(next_id)
         seen.append(next_id)
         # Stream the new token to the caller. ``flush_token`` lets the
@@ -2115,11 +2121,14 @@ def cmd_chat(args) -> int:
     # repeat_penalty to these.
     seen: list[int] = list(prompt_ids) + generated
     step_times: list[float] = []
+    stop_ids = getattr(tokenizer, "stop_token_ids", lambda: set())()
     for nxt in range(args.max_new):
         if args.no_sample:
             next_id = int(np.argmax(logits[-1]))
         else:
             next_id = sampler.sample(logits[-1], seen_ids=seen)
+        if next_id in stop_ids:
+            break
         generated.append(next_id)
         seen.append(next_id)
         next_text = tokenizer.decode([next_id])

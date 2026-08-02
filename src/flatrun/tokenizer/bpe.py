@@ -104,6 +104,7 @@ class BPETokenizer:
         added_tokens: dict[int, str] | None = None,
         unk_token: str | None = "<|endoftext|>",
         chat_template: str | None = None,
+        eos_token_id: int | None = None,
     ) -> None:
         self.vocab = dict(vocab)
         self.merges = list(merges)
@@ -112,6 +113,9 @@ class BPETokenizer:
         # Added / special tokens - highest priority in encoder.
         self.added_tokens = dict(added_tokens or {})
         self.unk_token = unk_token
+        # Explicit end-of-sequence token id, when declared by the model
+        # (GGUF ``tokenizer.ggml.eos_token_id`` or ``tokenizer_config.json``).
+        self.eos_token_id = eos_token_id
 
         # Pre-compute BPE merge ranks (lower = applied first).
         self.bpe_ranks = {pair: i for i, pair in enumerate(merges)}
@@ -249,6 +253,24 @@ class BPETokenizer:
                 # Not a byte-level token; emit UTF-8 of the char.
                 raw.extend(ch.encode("utf-8", errors="replace"))
         return raw.decode("utf-8", errors="replace")
+
+    def stop_token_ids(self) -> set[int]:
+        """Return the set of token ids that should end generation.
+
+        Prefers the model's explicitly-declared ``eos_token_id`` (read
+        from GGUF ``tokenizer.ggml.eos_token_id`` or ``tokenizer_config.json``).
+        When the model does not declare one, falls back to scanning the
+        added/special-token table for common end-of-turn markers
+        (``<|endoftext|>``, ``<|im_end|>``, ``</s>``, ``<|end|>``,
+        ``<|eot_id|>``).
+        """
+        if self.eos_token_id is not None:
+            return {int(self.eos_token_id)}
+        stop: set[int] = set()
+        for tid, tok in self.added_tokens.items():
+            if any(s in tok for s in ("im_end", "endoftext", "/s>", "end>", "eot_id")):
+                stop.add(int(tid))
+        return stop
 
     # ------------------------------------------------------------------
     # Chat templates
@@ -538,6 +560,7 @@ def load_from_vocab_merges(
         merges=merges,
         added_tokens=added_tokens,
         chat_template=chat_template,
+        eos_token_id=_read_eos_token_id(tokenizer_config_path, vocab, added_tokens),
     )
 
 
@@ -599,6 +622,7 @@ def load_from_tokenizer_json(
         merges=merges,
         added_tokens=added_tokens,
         chat_template=chat_template,
+        eos_token_id=_read_eos_token_id(tokenizer_config_path, vocab, added_tokens),
     )
 
 
@@ -623,6 +647,45 @@ def _read_chat_template(path: Path | str | None) -> str | None:
     if not isinstance(template, str) or not template.strip():
         return None
     return template
+
+
+def _read_eos_token_id(
+    path: Path | str | None,
+    vocab: dict[str, int] | None = None,
+    added_tokens: dict[int, str] | None = None,
+) -> int | None:
+    """Read an ``eos_token_id`` from a ``tokenizer_config.json``.
+
+    Prefers the explicit ``eos_token_id`` integer field (HF layout).
+    Falls back to resolving the ``eos_token`` string/object through the
+    vocab / added-token tables (the layout Flatbuild writes).
+    """
+    if path is None:
+        return None
+    p = Path(path)
+    if not p.is_file():
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    tid = data.get("eos_token_id")
+    if isinstance(tid, int):
+        return int(tid)
+
+    eos = data.get("eos_token")
+    if isinstance(eos, dict):
+        eos = eos.get("content")
+    if isinstance(eos, str):
+        if vocab is not None and eos in vocab:
+            return int(vocab[eos])
+        if added_tokens is not None:
+            for added_id, token in added_tokens.items():
+                if token == eos:
+                    return int(added_id)
+    return None
 
 
 # GGUF ``tokenizer.ggml.*`` type ids used to distinguish normal vs
@@ -704,12 +767,17 @@ def load_from_gguf_metadata(
     unk_id = int(meta.get("tokenizer.ggml.padding_token_id", 0))
     unk_token = tokens[unk_id] if 0 <= unk_id < len(tokens) else None
 
+    # Explicit end-of-sequence id, when the GGUF declares one.
+    eos_raw = meta.get("tokenizer.ggml.eos_token_id")
+    eos_token_id = int(eos_raw) if isinstance(eos_raw, int) else None
+
     return BPETokenizer(
         vocab=vocab,
         merges=merges,
         added_tokens=added_tokens,
         unk_token=unk_token,
         chat_template=chat_template,
+        eos_token_id=eos_token_id,
     )
 
 
