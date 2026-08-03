@@ -43,7 +43,7 @@ enabling inference on models larger than available system RAM.
 Download **Flatbot-micro-4M**, the official demonstration model trained entirely from scratch with Flatbuild:
 
 ```bash
-wget https://huggingface.co/flatseek/flatbot-micro-4M/resolve/main/model.gguf -O flatbot-micro-4M.gguf
+wget https://huggingface.co/flatseek/flatbot-micro-4M/resolve/main/flatbot-micro-4M.gguf -O flatbot-micro-4M.gguf
 ```
 
 Start an interactive chat:
@@ -58,16 +58,14 @@ Example session:
 Detected format: gguf
 Building tokenizer from GGUF metadata (flatbot-micro-4M.gguf) ...
 Tokenizer vocab: 516
+Chat template: {% if messages and messages[0]['role'] != 'system' %}{{ 'You...
 Loaded model in 0.01 s; layers=6
 
-Chat mode (max_new=128/turn, history=True).
-Type your message; Ctrl-D (EOF) or 'exit' to quit.
+Chat mode (max_new=128/turn, history=True).  Type your message; Ctrl-D (EOF) or 'exit' to quit.
 
 You: Who are you?
-
 Assistant:
-Sure — I'm Flatbot — a small conversational assistant trained from
-scratch using Flatbuild.
+Sure — I'm Flatbot — I'm Flatbot — an assistant trained on a sm a sm chat assistant.
 ```
 
 Want to expose the same model over HTTP? `flatrun serve` provides OpenAI-
