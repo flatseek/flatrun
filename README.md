@@ -38,50 +38,70 @@ enabling inference on models larger than available system RAM.
 </div>
 
 ---
-## Try It
+## See It In Action
 
-Download a sample GGUF model from Hugging Face and start an interactive chat:
+Download **Flatbot-micro-4M**, the official demonstration model trained entirely from scratch with Flatbuild:
 
 ```bash
-wget https://huggingface.co/lmstudio-community/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf -O smoll.gguf
+wget https://huggingface.co/flatseek/flatbot-micro-4M/resolve/main/model.gguf -O flatbot-micro-4M.gguf
+```
 
-flatrun chat --model smoll.gguf
+Start an interactive chat:
+
+```bash
+flatrun chat --model flatbot-micro-4M.gguf --temp 0.2
 ```
 
 Example session:
 
 ```text
 Detected format: gguf
-Building tokenizer from GGUF metadata (SmolLM2-135M-Instruct-Q4_K_M.gguf) ...
-Tokenizer vocab: 49152
-Chat template: Qwen2 ChatML
-Loaded model in 0.53 s; layers=30
+Building tokenizer from GGUF metadata (flatbot-micro-4M.gguf) ...
+Tokenizer vocab: 516
+Loaded model in 0.01 s; layers=6
 
 Chat mode (max_new=128/turn, history=True).
 Type your message; Ctrl-D (EOF) or 'exit' to quit.
 
-You: where is paris?
+You: Who are you?
 
 Assistant:
-Paris is the capital and largest city of France. It is located in the
-north-central part of the country along the Seine River and is one of
-Europe's major cultural, historical, and economic centers.
-
+Sure — I'm Flatbot — a small conversational assistant trained from
+scratch using Flatbuild.
 ```
 
-Want to expose the same model over HTTP? `flatrun serve` ships
-OpenAI- and Anthropic-compatible endpoints on the same port:
+Want to expose the same model over HTTP? `flatrun serve` provides OpenAI-
+and Anthropic-compatible APIs on the same port:
 
 ```bash
-pip install 'flatrun[serve]'
-flatrun serve --model smoll.gguf --port 8080
-# then in Python:
-# from openai import OpenAI
-# client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="not-needed")
+pip install "flatrun[serve]"
+
+flatrun serve \
+    --model flatbot-micro-4M.gguf \
+    --port 8080
 ```
 
-See [`docs/serve.md`](docs/serve.md) for the full endpoint list and
-streaming-event shapes.
+Example using the OpenAI Python SDK:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8080/v1",
+    api_key="not-needed",
+)
+
+response = client.chat.completions.create(
+    model="flatbot-micro-4M",
+    messages=[
+        {"role": "user", "content": "Who are you?"}
+    ],
+)
+
+print(response.choices[0].message.content)
+```
+
+See [`docs/serve.md`](docs/serve.md) for the complete API reference, supported endpoints, and streaming response formats.
 
 ---
 # Overview
