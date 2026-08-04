@@ -4,6 +4,8 @@
 
 # Flatrun
 
+<img src="https://github.com/flatseek/flatbot/raw/main/flatbot-chat.png" alt="Flatbot Chat Interface">
+
 **The streaming inference runtime for open-weight LLMs.**
 
 <p align="center">
@@ -34,6 +36,13 @@ enabling inference on models larger than available system RAM.
 [Flatbuild](https://github.com/flatseek/flatbuild) (LLM Training) •
 [Flattune](https://github.com/flatseek/flattune) (LLM Fine-Tuning) •
 [Flatrun](https://github.com/flatseek/flatrun) (LLM Inference)
+
+---
+**Demo Inference:** [chat.flatseek.io](https://chat.flatseek.io)
+&nbsp;&middot;&nbsp;
+**Web Chat:** [Flatbot](https://github.com/flatseek/flatbot)
+&nbsp;&middot;&nbsp;
+**Released Model:** [Flatbot-Micro-4M](https://huggingface.co/flatseek/flatbot-micro-4M)
 
 </div>
 
