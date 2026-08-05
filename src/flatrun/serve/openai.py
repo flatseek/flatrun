@@ -134,6 +134,7 @@ async def list_models(request: Request) -> JSONResponse:
 @router.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any:
     eng = _engine(request)
+    model_id = body.model or eng.model_id
     max_tokens = body.max_tokens if body.max_tokens is not None else 256
     if max_tokens <= 0:
         raise BadRequestError("max_tokens must be > 0")
