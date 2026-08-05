@@ -219,7 +219,7 @@ class GenerationEngine:
     def max_context(self, model_id: str | None = None) -> int:
         cfg = self.get_model(model_id).loaded.config
         if cfg is not None and cfg.raw is not None:
-            return int(cfg.raw.get("max_position_embeddings", 32768))
+            return int(cfg.raw.get("max_position_embeddings", 32768)
         return 32768
 
     # ------------------------------------------------------------------
