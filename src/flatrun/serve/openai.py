@@ -348,6 +348,7 @@ def _collect_chat_text(
     eng: GenerationEngine,
     messages: list[dict],
     req: GenerationRequest,
+    model_id: str | None = None,
 ) -> tuple[str, str]:
     """Run the engine to completion and split reasoning from visible text.
 
