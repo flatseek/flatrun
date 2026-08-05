@@ -47,7 +47,7 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
-    temperature: float | None = None
+    temperature: float = 0.7
     top_p: float = 1.0
     n: int = 1
     max_tokens: int | None = None
@@ -62,7 +62,7 @@ class ChatCompletionRequest(BaseModel):
 class CompletionRequest(BaseModel):
     model: str
     prompt: str
-    temperature: float | None = None
+    temperature: float = 0.7
     top_p: float = 1.0
     n: int = 1
     max_tokens: int = 16
@@ -150,7 +150,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
     req = GenerationRequest(
         prompt=prompt_text,
         max_tokens=max_tokens,
-        temperature=body.temperature if body.temperature is not None else 0.05,
+        temperature=body.temperature,
         top_p=body.top_p,
         top_k=0,
         stop=_stop_list(body.stop),

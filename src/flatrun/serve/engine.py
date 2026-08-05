@@ -236,7 +236,7 @@ class GenerationEngine:
         """
         prompt_ids = self._tokenizer.encode(prompt_text)
         sampler = Sampler(
-            temperature=request.temperature if request.temperature is not None else 0.05,
+            temperature=request.temperature or 1.0,
             top_k=request.top_k,
             top_p=request.top_p,
             min_p=0.0,

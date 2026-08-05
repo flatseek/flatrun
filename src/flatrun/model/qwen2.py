@@ -35,13 +35,6 @@ from typing import Callable, Sequence
 import numpy as np
 
 from ..dequant.loader import dequant_handle, dequant_mlx_weight
-
-
-def _fetch_norm(handle, dtype: str = "float32") -> np.ndarray:
-    """Fetch a 1-D norm weight, dequantizing if needed."""
-    if handle.metadata.quantization is not None:
-        return dequant_handle(handle, dtype=dtype)
-    return handle.as_numpy().astype(np.dtype(dtype), copy=False)
 from ..dequant.mlx import dequant_mlx_4bit_split
 from ..runtime.kv_cache import KVCache
 from ..runtime.scheduler import LayerHandles
@@ -479,39 +472,6 @@ def _apply_rope(
             x_second * cos_p + x_first * sin_p,
         ],
         axis=-1,
-    )
-
-
-def _unpermute_qk_for_gguf_llama(
-    weights: "np.ndarray", n_head: int, n_head_kv: int,
-) -> "np.ndarray":
-    """Inverse of the ``_permute_qk`` applied during GGUF llama export.
-
-    flatbuild's GGUF export applies ``_permute_qk`` to Q/K weights, which
-    interleaves consecutive pairs within each head. After ``_as_linear``,
-    the Q matrix is in interleaved layout but flatrun's ``_apply_rope`` with
-    ``interleaved=True`` (NORM RoPE) expects non-interleaved (half-split) layout.
-    Applying this inverse restores the half-split ordering so RoPE is correct.
-
-    K from GGUF does NOT need this — ``_as_linear`` transposes K from
-    (hidden, kv_heads*head_dim) to (kv_heads*head_dim, hidden), and the
-    transpose already converts the interleaved column layout to the correct
-    half-split ordering for NORM RoPE.
-
-    Args:
-        weights: Q projection weight of shape ``(n_heads*head_dim, hidden)``.
-        n_head: Number of query heads.
-        n_head_kv: Number of KV heads (GQA).
-
-    Returns:
-        Weights in half-split layout (same shape).
-    """
-    if n_head_kv is not None and n_head != n_head_kv:
-        n_head = n_head_kv
-    return (
-        weights.reshape(n_head, 2, weights.shape[0] // n_head // 2, weights.shape[1])
-        .swapaxes(1, 2)
-        .reshape(weights.shape)
     )
 
 
@@ -1021,12 +981,12 @@ def make_qwen2_forwarder(
         # the manager. The second path is the common one for
         # the prediction-evolution analyzer.
         if "model.norm.weight" in handles:
-            norm_w = _fetch_norm(handles["model.norm.weight"])
+            norm_w = handles["model.norm.weight"].as_numpy().astype(np.float32)
         elif _norm_w_cache is not None:
             norm_w = _norm_w_cache
         else:
             norm_handle = mgr.acquire("model.norm.weight")
-            norm_w = _fetch_norm(norm_handle)
+            norm_w = norm_handle.as_numpy().astype(np.float32)
             _norm_w_cache = norm_w
 
         # Tied embeddings shortcut: the head is the embedding
@@ -1454,9 +1414,9 @@ def make_qwen2_forwarder(
 
         # ----- Attention -----
         with _p("load_tensors", _P):
-            attn_norm_w = _fetch_norm(handles[
+            attn_norm_w = handles[
                 f"model.layers.{idx}.input_layernorm.weight"
-            ], dtype="float32")
+            ].as_numpy().astype(np.float32)
         residual = hidden
         with _p("rms_norm_attn", _P):
             x = _rms_norm(hidden, attn_norm_w, config.rms_norm_eps)
@@ -1560,10 +1520,6 @@ def make_qwen2_forwarder(
         else:
             q_w = _as_linear(q_w, config.hidden_size, f"layer{idx}.q_proj")
             k_w = _as_linear(k_w, config.hidden_size, f"layer{idx}.k_proj")
-            if config.rope_interleaved:
-                q_w = _unpermute_qk_for_gguf_llama(
-                    q_w, config.num_attention_heads, config.num_key_value_heads,
-                )
             v_w = _as_linear(v_w, config.hidden_size, f"layer{idx}.v_proj")
             with _p("qkv_proj", _P):
                 qkv_w = np.concatenate([q_w, k_w, v_w], axis=0).astype(np_dtype, copy=False)
@@ -1616,9 +1572,9 @@ def make_qwen2_forwarder(
                     f"got q={q_norm_w is not None} k={k_norm_w is not None}"
                 )
             with _p("q_norm", _P):
-                q = _rms_norm(q, _fetch_norm(q_norm_w), config.rms_norm_eps)
+                q = _rms_norm(q, q_norm_w.as_numpy().astype(np.float32), config.rms_norm_eps)
             with _p("k_norm", _P):
-                k = _rms_norm(k, _fetch_norm(k_norm_w), config.rms_norm_eps)
+                k = _rms_norm(k, k_norm_w.as_numpy().astype(np.float32), config.rms_norm_eps)
 
         with _p("rope", _P):
             q = _apply_rope(q, cos_cache, sin_cache, positions,
@@ -1695,9 +1651,9 @@ def make_qwen2_forwarder(
 
         # ----- MLP (SwiGLU) -----
         with _p("load_tensors", _P):
-            mlp_norm_w = _fetch_norm(handles[
+            mlp_norm_w = handles[
                 f"model.layers.{idx}.post_attention_layernorm.weight"
-            ], dtype="float32")
+            ].as_numpy().astype(np.float32)
         residual = hidden
         with _p("rms_norm_mlp", _P):
             x = _rms_norm(hidden, mlp_norm_w, config.rms_norm_eps)
@@ -1851,10 +1807,9 @@ def make_qwen2_forwarder(
         attn_scale = config.query_pre_attn_scalar or head_dim
 
         # ----- Attention -----
-        attn_norm_w = _fetch_norm(
-            handles[
-                f"model.layers.{idx}.input_layernorm.weight"
-            ], dtype="float32")
+        attn_norm_w = handles[
+            f"model.layers.{idx}.input_layernorm.weight"
+        ].as_numpy().astype(np.float32)
         residual = hidden
         x = _gemma3_norm(hidden, attn_norm_w, config.rms_norm_eps)
 
@@ -1884,14 +1839,12 @@ def make_qwen2_forwarder(
         # Q / K RMSNorm with Gemma's ``1 + weight`` gain. The norm
         # is applied to each (seq, head, head_dim) slice, *before*
         # RoPE - same placement as Qwen3.
-        q_norm_w = _fetch_norm(
-            handles[
-                f"model.layers.{idx}.self_attn.q_norm.weight"
-            ], dtype="float32")
-        k_norm_w = _fetch_norm(
-            handles[
-                f"model.layers.{idx}.self_attn.k_norm.weight"
-            ], dtype="float32")
+        q_norm_w = handles[
+            f"model.layers.{idx}.self_attn.q_norm.weight"
+        ].as_numpy().astype(np.float32)
+        k_norm_w = handles[
+            f"model.layers.{idx}.self_attn.k_norm.weight"
+        ].as_numpy().astype(np.float32)
         q = _gemma3_norm(q, q_norm_w, config.rms_norm_eps)
         k = _gemma3_norm(k, k_norm_w, config.rms_norm_eps)
 
@@ -1930,9 +1883,9 @@ def make_qwen2_forwarder(
         hidden = residual + attn_out
 
         # ----- MLP (SwiGLU) with pre/post norms -----
-        pre_mlp_norm_w = _fetch_norm(handles[
+        pre_mlp_norm_w = handles[
             f"model.layers.{idx}.pre_feedforward_layernorm.weight"
-        ], dtype="float32")
+        ].as_numpy().astype(np.float32)
         residual = hidden
         x = _gemma3_norm(hidden, pre_mlp_norm_w, config.rms_norm_eps)
 
@@ -1969,9 +1922,9 @@ def make_qwen2_forwarder(
         # block's output (after the MLP residual) before handing it to
         # the next layer. This is what differentiates Gemma's residual
         # pattern from Qwen2 / Llama.
-        post_mlp_norm_w = _fetch_norm(handles[
+        post_mlp_norm_w = handles[
             f"model.layers.{idx}.post_feedforward_layernorm.weight"
-        ], dtype="float32")
+        ].as_numpy().astype(np.float32)
         hidden = _gemma3_norm(hidden, post_mlp_norm_w, config.rms_norm_eps)
         del (
             q_w, k_w, v_w, qkv_w, qkv, q, k, v,
@@ -2011,8 +1964,9 @@ def make_qwen2_forwarder(
             dequant_cache.enter_layer(idx)
         seq_len = hidden.shape[0]
         residual = hidden
-        attn_norm_w = _fetch_norm(
-            handles[f"model.layers.{idx}.input_layernorm.weight"], dtype="float32")
+        attn_norm_w = handles[
+            f"model.layers.{idx}.input_layernorm.weight"
+        ].as_numpy().astype(np.float32)
         x = _rms_norm(hidden, attn_norm_w, config.rms_norm_eps)
 
         q_w, _ = _fetch_linear_with_quant(
@@ -2045,11 +1999,11 @@ def make_qwen2_forwarder(
         )
         if q_norm_w is not None and k_norm_w is not None:
             if config.qk_norm_gain:
-                q = _gemma3_norm(q, _fetch_norm(q_norm_w), config.rms_norm_eps)
-                k = _gemma3_norm(k, _fetch_norm(k_norm_w), config.rms_norm_eps)
+                q = _gemma3_norm(q, q_norm_w.as_numpy().astype(np.float32), config.rms_norm_eps)
+                k = _gemma3_norm(k, k_norm_w.as_numpy().astype(np.float32), config.rms_norm_eps)
             else:
-                q = _rms_norm(q, _fetch_norm(q_norm_w), config.rms_norm_eps)
-                k = _rms_norm(k, _fetch_norm(k_norm_w), config.rms_norm_eps)
+                q = _rms_norm(q, q_norm_w.as_numpy().astype(np.float32), config.rms_norm_eps)
+                k = _rms_norm(k, k_norm_w.as_numpy().astype(np.float32), config.rms_norm_eps)
 
         past = kv.stack(idx)
         past_len = 0 if past is None else int(past[0].shape[0])
@@ -2097,9 +2051,9 @@ def make_qwen2_forwarder(
         # MLP - same SwiGLU as Qwen2 / Qwen3. Qwen3.5's per-layer
         # norm positions are the same as Qwen3: pre-feedforward
         # (post-attention) and post-feedforward.
-        post_attn_norm_w = _fetch_norm(
-            handles[f"model.layers.{idx}.post_attention_layernorm.weight"],
-            dtype="float32")
+        post_attn_norm_w = handles[
+            f"model.layers.{idx}.post_attention_layernorm.weight"
+        ].as_numpy().astype(np.float32)
         residual = hidden
         x = _rms_norm(hidden, post_attn_norm_w, config.rms_norm_eps)
 
@@ -2279,7 +2233,7 @@ def make_qwen2_forwarder(
             return hidden
 
         # ----- Final norm + LM head, after the last block has run -----
-        norm_w = _fetch_norm(handles["model.norm.weight"])
+        norm_w = handles["model.norm.weight"].as_numpy().astype(np.float32)
         # Gemma 3's ``model.norm`` is also a Gemma3RMSNorm
         # (``1 + weight`` gain); every other arch uses plain RMSNorm.
         if config.model_arch == "gemma3":
