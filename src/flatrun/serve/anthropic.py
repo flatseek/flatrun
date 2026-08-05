@@ -97,10 +97,10 @@ async def messages(body: MessagesRequest, request: Request) -> Any:
     chatml = _to_chatml([m.model_dump() for m in body.messages], body.system)
     prompt_text = eng.tokenizer.apply_chat_template(chatml, add_generation_prompt=True)
     prompt_ids = eng.tokenizer.encode(prompt_text)
-    if len(prompt_ids) + body.max_tokens > eng.max_context:
+    if len(prompt_ids) + body.max_tokens > eng.max_context(model_id):
         raise ContextLengthError(
             f"prompt ({len(prompt_ids)} tokens) + max_tokens ({body.max_tokens}) "
-            f"exceeds model context ({eng.max_context})"
+            f"exceeds model context ({eng.max_context(model_id)})"
         )
     req = GenerationRequest(
         prompt=prompt_text,
