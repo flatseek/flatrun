@@ -114,7 +114,7 @@ async def messages(body: MessagesRequest, request: Request) -> Any:
     model_id = body.model or eng.model_id
 
     if not body.stream:
-        text, reasoning = _collect_anthropic_text(eng, chatml, req)
+        text, reasoning = _collect_anthropic_text(eng, chatml, req, model_id)
         resp: dict[str, Any] = {
             "id": msg_id,
             "type": "message",
@@ -165,7 +165,7 @@ async def messages(body: MessagesRequest, request: Request) -> Any:
         # is done (or until a ``stop_sequence`` matches).
         thinking_open = False
         text_open = False
-        for kind, payload in eng.stream_chat(chatml, req):
+        for kind, payload in eng.stream_chat(chatml, req, model_id):
             if kind == "reasoning" and not thinking_open:
                 yield _sse_event(
                     "content_block_start",
@@ -211,11 +211,12 @@ def _collect_anthropic_text(
     eng: GenerationEngine,
     chatml: list[dict],
     req: GenerationRequest,
+    model_id: str | None = None,
 ) -> tuple[str, str]:
     """Run the engine to completion and split reasoning vs text."""
     reasoning_parts: list[str] = []
     text_parts: list[str] = []
-    for kind, payload in eng.stream_chat(chatml, req):
+    for kind, payload in eng.stream_chat(chatml, req, model_id):
         if kind == "reasoning":
             reasoning_parts.append(payload)
         else:

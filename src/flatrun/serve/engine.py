@@ -61,12 +61,28 @@ class GenerationRequest:
     seed: int | None = None
 
 
-class GenerationEngine:
-    """One model, one executor, one tokenizer — owned for the process lifetime.
+class _ModelInstance:
+    """Loaded model with its executor and tokenizer."""
+    
+    def __init__(
+        self,
+        model_id: str,
+        loaded,
+        tokenizer,
+        executor: StreamingExecutor,
+    ) -> None:
+        self.model_id = model_id
+        self.loaded = loaded
+        self.tokenizer = tokenizer
+        self.executor = executor
 
-    Instantiate once during FastAPI startup. ``stream_chat`` and
-    ``stream_complete`` are the only entry points HTTP handlers
-    should call.
+
+class GenerationEngine:
+    """Multiple models, multiple executors — owned for the process lifetime.
+
+    Instantiate once during FastAPI startup. Supports multiple GGUF files
+    in a directory. ``stream_chat`` and ``stream_complete`` select the
+    model based on request.
     """
 
     def __init__(
@@ -81,62 +97,83 @@ class GenerationEngine:
         self._model_path = model
         self._cache_mb = cache_mb
         self._dequant_cache = dequant_cache
-        # ``RuntimeConfig`` is the same one the CLI uses, with the
-        # cache cap the user passed. ``probe=None`` matches the CLI
-        # default — the memory manager falls back to its built-in
-        # RSS probe.
-        cfg = RuntimeConfig(memory=MemoryConfig(cache_bytes=cache_mb * 1024 * 1024, probe=None))
-        # ``_resolve_model_paths`` is private to ``cli`` but its
-        # behaviour (file vs directory, GGUF detection) is exactly
-        # what we want here too. We import the function rather than
-        # re-implementing so the two surfaces stay aligned.
+        self._tokenizer_path = tokenizer
+        self._backend = backend
+        self._models: dict[str, _ModelInstance] = {}
+        self._default_model_id: str | None = None
+        self._created = int(time.time())
+        
+        # Load models from path
+        self._load_models()
+
+    def _load_models(self) -> None:
+        """Load all GGUF files from the model path."""
         from argparse import ArgumentParser
 
         _stub = ArgumentParser()
         _stub.exit = lambda *_a, **_kw: None
-        model_dir, gguf_path, fmt = _resolve_model_paths(_FakeArgs(model), _stub)
-        if fmt == "gguf" and gguf_path is None:
-            gguf_path = _pick_gguf_file(model_dir, _stub)
-        self._format = fmt
-        self._gguf_path = gguf_path
-        self._tokenizer = self._build_tokenizer(model_dir, tokenizer, gguf_path, fmt)
-        # The CLI's loader prints cache-bump messages. We mirror the
-        # same behaviour here so a user running ``flatrun serve`` sees
-        # the same "bumping cache from N MiB to M MiB" hint if their
-        # model is bigger than the default.
-        loaded = load_huggingface(model_dir, config=cfg)
+        
+        model_path = Path(self._model_path)
+        
+        if model_path.is_file() and model_path.suffix == ".gguf":
+            # Single GGUF file
+            gguf_path = model_path
+            model_dir = model_path.parent
+            model_id = model_path.stem
+            self._load_single_model(model_id, model_dir, gguf_path, _stub)
+            self._default_model_id = model_id
+        elif model_path.is_dir():
+            # Directory - load all GGUF files
+            gguf_files = sorted(model_path.glob("*.gguf"))
+            if not gguf_files:
+                raise FileNotFoundError(f"No .gguf files in {model_path}")
+            
+            for gguf_path in gguf_files:
+                model_id = gguf_path.stem
+                self._load_single_model(model_id, model_path, gguf_path, _stub)
+            
+            self._default_model_id = gguf_files[0].stem
+        else:
+            raise FileNotFoundError(f"Model path not found: {model_path}")
+
+    def _load_single_model(
+        self,
+        model_id: str,
+        model_dir: Path,
+        gguf_path: Path,
+        stub,
+    ) -> None:
+        """Load a single GGUF model."""
+        cfg = RuntimeConfig(memory=MemoryConfig(cache_bytes=self._cache_mb * 1024 * 1024, probe=None))
+        
+        fmt = "gguf"
+        tokenizer = self._build_tokenizer(model_dir, self._tokenizer_path, gguf_path, fmt)
+        
+        loaded = load_huggingface(gguf_path, config=cfg)
         largest = max(
             (loaded.runtime.get_metadata(k.name).byte_size for k in loaded.runtime.list_tensors()),
             default=0,
         )
-        if largest > 0 and cache_mb == 256:
+        if largest > 0 and self._cache_mb == 256:
             recommended_mb = max(
                 256,
                 ((largest * 4) + (128 * 1024 * 1024) - 1) // (128 * 1024 * 1024) * 128,
             )
-            if recommended_mb > cache_mb:
-                cache_mb = recommended_mb
+            if recommended_mb > self._cache_mb:
                 loaded.runtime.close()
                 cfg = RuntimeConfig(
-                    memory=MemoryConfig(cache_bytes=cache_mb * 1024 * 1024, probe=None)
+                    memory=MemoryConfig(cache_bytes=recommended_mb * 1024 * 1024, probe=None)
                 )
-                loaded = load_huggingface(model_dir, config=cfg)
-        self._loaded = loaded
-        # Forwarder / scheduler / executor — same recipe as the CLI.
-        if fmt == "gguf":
-            raw_cfg = _build_config_from_gguf(gguf_path)
-            qcfg = Qwen2Config.from_hf_config(raw_cfg)
-            qcfg.quant_gguf = "Q8_0"
-        else:
-            if loaded.config is None or loaded.config.raw is None:
-                raise RuntimeError("No config.json found next to model weights")
-            qcfg = Qwen2Config.from_hf_config(loaded.config.raw)
-            qcfg.quant_mlx_4bit = fmt == "mlx"
-            qcfg.quant_gguf = None
-        be = get_backend(backend)
+                loaded = load_huggingface(gguf_path, config=cfg)
+        
+        raw_cfg = _build_config_from_gguf(gguf_path)
+        qcfg = Qwen2Config.from_hf_config(raw_cfg)
+        qcfg.quant_gguf = "Q8_0"
+        
+        be = get_backend(self._backend)
         forwarder = make_qwen2_forwarder(
             qcfg,
-            enable_dequant_cache=dequant_cache,
+            enable_dequant_cache=self._dequant_cache,
             backend=be,
         )
         scheduler = loaded.runtime.build_scheduler(
@@ -144,15 +181,18 @@ class GenerationEngine:
             pre_layer_names=loaded.manifest.pre_layer,
             post_layer_names=loaded.manifest.post_layer,
         )
-        self._executor = StreamingExecutor(scheduler, forwarder, kv_cache=KVCache(capacity=4096))
-        # ``_lock`` serialises concurrent requests. Streaming LLMs
-        # can't share an executor across interleaved requests because
-        # each call resets the KV cache, so the safest policy for
-        # v0 is "one request at a time". A request queue replaces
-        # this once we have a true async forward pass.
-        self._lock = threading.Lock()
-        self._model_id = model_dir.name or (gguf_path.stem if gguf_path else "model")
-        self._created = int(time.time())
+        executor = StreamingExecutor(scheduler, forwarder, kv_cache=KVCache(capacity=4096))
+        
+        self._models[model_id] = _ModelInstance(model_id, loaded, tokenizer, executor)
+        self._locks = {mid: threading.Lock() for mid in self._models}
+
+    def get_model(self, model_id: str | None) -> _ModelInstance:
+        """Get model instance by ID, or default."""
+        if model_id and model_id in self._models:
+            return self._models[model_id]
+        if self._default_model_id:
+            return self._models[self._default_model_id]
+        raise ValueError("No model loaded")
 
     # ------------------------------------------------------------------
     # Properties exposed to the API layer
@@ -160,7 +200,8 @@ class GenerationEngine:
 
     @property
     def model_id(self) -> str:
-        return self._model_id
+        """Default model ID."""
+        return self._default_model_id or "model"
 
     @property
     def created(self) -> int:
@@ -168,15 +209,15 @@ class GenerationEngine:
 
     @property
     def tokenizer(self):
-        return self._tokenizer
+        """Default tokenizer."""
+        default = self.get_model(None)
+        return default.tokenizer
 
-    @property
-    def vocab_size(self) -> int:
-        return len(self._tokenizer.vocab)
+    def vocab_size(self, model_id: str | None = None) -> int:
+        return len(self.get_model(model_id).tokenizer.vocab)
 
-    @property
-    def max_context(self) -> int:
-        cfg = self._loaded.config
+    def max_context(self, model_id: str | None = None) -> int:
+        cfg = self.get_model(model_id).loaded.config
         if cfg is not None and cfg.raw is not None:
             return int(cfg.raw.get("max_position_embeddings", 32768))
         return 32768
@@ -189,6 +230,7 @@ class GenerationEngine:
         self,
         messages: list[dict],
         request: GenerationRequest,
+        model_id: str | None = None,
     ) -> Iterator[tuple[str, str]]:
         """Yield ``(kind, text)`` events for an OpenAI-style chat call.
 
@@ -197,13 +239,15 @@ class GenerationEngine:
         splits these into separate content blocks; the OpenAI route
         emits ``reasoning`` content when the request asked for it.
         """
-        prompt_text = self._tokenizer.apply_chat_template(messages, add_generation_prompt=True)
-        yield from self._stream_with_thinking(prompt_text, request)
+        inst = self.get_model(model_id)
+        prompt_text = inst.tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        yield from self._stream_with_thinking(prompt_text, request, inst)
 
     def stream_complete(
         self,
         prompt: str,
         request: GenerationRequest,
+        model_id: str | None = None,
     ) -> Iterator[str]:
         """Yield token strings for a legacy text-completion call.
 
@@ -211,7 +255,7 @@ class GenerationEngine:
         BPE encoder directly, exactly as the OpenAI legacy endpoint
         expects.
         """
-        for kind, text in self._stream_with_thinking(prompt, request):
+        for kind, text in self._stream_with_thinking(prompt, request, self.get_model(model_id)):
             # Legacy completions ignore reasoning; emit everything as
             # text. The OpenAI route shapes them into the right JSON.
             yield text
@@ -220,6 +264,7 @@ class GenerationEngine:
         self,
         prompt_text: str,
         request: GenerationRequest,
+        inst: _ModelInstance,
     ) -> Iterator[tuple[str, str]]:
         """Core loop: prefill once, then decode ``max_tokens`` steps.
 
@@ -234,7 +279,7 @@ class GenerationEngine:
         and tags the events accordingly. Models that don't use
         reasoning tags emit everything as ``"text"``.
         """
-        prompt_ids = self._tokenizer.encode(prompt_text)
+        prompt_ids = inst.tokenizer.encode(prompt_text)
         sampler = Sampler(
             temperature=request.temperature or 1.0,
             top_k=request.top_k,
@@ -243,12 +288,13 @@ class GenerationEngine:
             repeat_penalty=1.0,
             seed=request.seed,
         )
+        lock = self._locks[inst.model_id]
         # The reason a lock wraps the whole loop and not just the
         # step is that we also mutate the executor's KV cache
         # between steps; another thread interleaving would corrupt
         # it. The lock is reentrant=False so a misbehaving handler
         # can't recursively call the engine.
-        with self._lock:
+        with lock:
             seen: list[int] = list(prompt_ids)
             generated: list[int] = []
             stop = {s for s in request.stop if s}
@@ -261,7 +307,7 @@ class GenerationEngine:
             buf = ""
             for _ in range(request.max_tokens):
                 ids = prompt_ids + generated if next_id == -1 else prompt_ids + generated
-                result = self._executor.step(tokens=ids)
+                result = inst.executor.step(tokens=ids)
                 logits = result.last_hidden[-1]
                 if request.temperature <= 0:
                     next_id = int(np.argmax(logits))
@@ -269,7 +315,7 @@ class GenerationEngine:
                     next_id = sampler.sample(logits, seen_ids=seen)
                 generated.append(next_id)
                 seen.append(next_id)
-                text = self._tokenizer.decode([next_id])
+                text = inst.tokenizer.decode([next_id])
                 buf += text
                 kind, payload = self._classify_token(state, buf)
                 if payload is not None:
@@ -280,10 +326,10 @@ class GenerationEngine:
                 # Stop sequences are checked AFTER the token is yielded
                 # so a stop on the very last token still flushes it.
                 for s in stop:
-                    if s and self._ends_with_token(generated, s, self._tokenizer):
+                    if s and self._ends_with_token(generated, s, inst.tokenizer):
                         return
                 # Common chat-model end-of-turn markers.
-                if next_id in self._stop_token_ids():
+                if next_id in self._stop_token_ids(inst.tokenizer):
                     return
 
     @staticmethod
@@ -364,7 +410,7 @@ class GenerationEngine:
             return state
         return state
 
-    def _stop_token_ids(self) -> set[int]:
+    def _stop_token_ids(self, tokenizer) -> set[int]:
         """Return token IDs the chat template treats as end-of-turn.
 
         Anything in the tokenizer's added-tokens table that looks
@@ -373,7 +419,7 @@ class GenerationEngine:
         benefit from the same scan.
         """
         stop_ids: set[int] = set()
-        for tid, tok in getattr(self._tokenizer, "added_tokens", {}).items():
+        for tid, tok in getattr(tokenizer, "added_tokens", {}).items():
             if any(s in tok for s in ("im_end", "endoftext", "/s>", "end>", "eot_id")):
                 stop_ids.add(int(tid))
         return stop_ids

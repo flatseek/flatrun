@@ -161,7 +161,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
     model_id = body.model or eng.model_id
 
     if not body.stream:
-        text, reasoning = _collect_chat_text(eng, [m.model_dump() for m in body.messages], req)
+        text, reasoning = _collect_chat_text(eng, [m.model_dump() for m in body.messages], req, model_id)
         resp = {
             "id": completion_id,
             "object": "chat.completion",
@@ -205,7 +205,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
             }
         )
         for kind, payload in eng.stream_chat(
-            [m.model_dump() for m in body.messages], req
+            [m.model_dump() for m in body.messages], req, model_id
         ):
             if kind == "reasoning":
                 reasoning_buf.append(payload)
@@ -281,7 +281,7 @@ async def completions(body: CompletionRequest, request: Request) -> Any:
     model_id = body.model or eng.model_id
 
     if not body.stream:
-        text = "".join(eng.stream_complete(body.prompt, req))
+        text = "".join(eng.stream_complete(body.prompt, req, model_id))
         return JSONResponse(
             {
                 "id": completion_id,
@@ -314,7 +314,7 @@ async def completions(body: CompletionRequest, request: Request) -> Any:
                 "choices": [{"text": "", "index": 0, "logprobs": None, "finish_reason": None}],
             }
         )
-        for tok in eng.stream_complete(body.prompt, req):
+        for tok in eng.stream_complete(body.prompt, req, model_id):
             yield _sse_format(
                 {
                     "id": completion_id,
@@ -360,7 +360,7 @@ def _collect_chat_text(
     """
     reasoning_parts: list[str] = []
     text_parts: list[str] = []
-    for kind, payload in eng.stream_chat(messages, req):
+    for kind, payload in eng.stream_chat(messages, req, model_id):
         if kind == "reasoning":
             reasoning_parts.append(payload)
         else:
